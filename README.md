@@ -45,8 +45,15 @@ python server/highway_conditions.py --geometry ./geometry --port 8788 \
 
 See `PROTOCOL.md §6`/`§7` for the full route table, env vars (`ARD_OWNER_TOKEN`,
 `ARD_SEED_TOKENS`, `ARD_DISCORD_CLIENT_SECRET`, `ARD_DISCORD_ADMINS`, `ARD_BOT_SECRET`,
-`ARD_TRUSTED_PROXIES`, `ARD_NTFY_URL`/`ARD_NTFY_TOKEN` for ops alerts, `ARD_MIN_DISCORD_AGE_DAYS`), and deploy notes
-(secrets via environment, never CLI flags, on a shared box).
+`ARD_TRUSTED_PROXIES`, `ARD_NTFY_URL`/`ARD_NTFY_TOKEN` for ops alerts, `ARD_MIN_DISCORD_AGE_DAYS`,
+`ARD_REQUIRE_OWNERSHIP_PROOF`/`ARD_PRESENCE_CHECK` — both default true, set to `0`/`false` to
+disable either without touching the systemd unit), and deploy notes (secrets via environment,
+never CLI flags, on a shared box).
+
+**`ARD_REQUIRE_OWNERSHIP_PROOF=0`/`ARD_PRESENCE_CHECK=0`** exist specifically so an operator can
+turn either off from the env file alone — e.g. disable the Mojang ownership-proof gate until the
+producer plugins (`plugin-aquarius`/`plugin-zenith`/`client-fabric`, all in the public repo) carry
+the client-side `session/minecraft/join` call it depends on, without editing `ExecStart=`.
 
 ## Keeping this in sync with the public repo
 

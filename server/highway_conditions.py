@@ -1743,7 +1743,29 @@ def apply_env_secrets(args, environ=None):
             args.min_discord_age_days = int(environ.get("ARD_MIN_DISCORD_AGE_DAYS", "0") or "0")
         except ValueError:
             raise SystemExit("ARD_MIN_DISCORD_AGE_DAYS must be an integer number of days")
+    # require_ownership_proof/presence_check default to None on the CLI (not
+    # True/False) specifically so this can tell "not specified on the command
+    # line" apart from "explicitly set to True" -- both flags default True in
+    # build_app, but an operator needs an env-only way to turn either off
+    # without editing a systemd ExecStart= line (e.g. before the producer
+    # plugins carry the client-side Mojang join-call capability §6.2 step 1.5
+    # needs).
+    if getattr(args, "require_ownership_proof", None) is None:
+        env_val = environ.get("ARD_REQUIRE_OWNERSHIP_PROOF")
+        args.require_ownership_proof = _parse_bool_env(env_val) if env_val is not None else True
+    if getattr(args, "presence_check", None) is None:
+        env_val = environ.get("ARD_PRESENCE_CHECK")
+        args.presence_check = _parse_bool_env(env_val) if env_val is not None else True
     return args
+
+
+def _parse_bool_env(value):
+    v = value.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    raise SystemExit(f"expected a boolean-like value (1/0, true/false, yes/no, on/off), got {value!r}")
 
 
 def _wire_events(store, notifier):
@@ -1859,15 +1881,17 @@ def main(argv=None):
                           "0 disables -- or set ARD_MIN_DISCORD_AGE_DAYS")
     ap.add_argument("--max-linked-uids", type=int, default=identity.DEFAULT_MAX_LINKED_UIDS,
                      help="max Minecraft UIDs one Discord identity may link (MAX_LINKED_UIDS)")
-    ap.add_argument("--require-ownership-proof", action=argparse.BooleanOptionalAction, default=True,
+    ap.add_argument("--require-ownership-proof", action=argparse.BooleanOptionalAction, default=None,
                      help="require a Mojang session/minecraft/join ownership proof "
                           "(see /link/verify-ownership) before /link/complete mints a "
-                          "Tier B token; --no-require-ownership-proof for local/dev runs "
-                          "without live Mojang connectivity")
-    ap.add_argument("--presence-check", action=argparse.BooleanOptionalAction, default=True,
+                          "Tier B token; defaults True; --no-require-ownership-proof for "
+                          "local/dev runs or until producer plugins support it -- or set "
+                          "ARD_REQUIRE_OWNERSHIP_PROOF")
+    ap.add_argument("--presence-check", action=argparse.BooleanOptionalAction, default=None,
                      help="check a Tier B reporter's linked account against a third-party "
                           "presence source (2b2t.vc, for 2b2t.org only) at report time; "
-                          "--no-presence-check disables it entirely")
+                          "defaults True; --no-presence-check disables it entirely -- or "
+                          "set ARD_PRESENCE_CHECK")
     ap.add_argument("--discord-client-id", help="Discord OAuth app client ID")
     ap.add_argument("--discord-client-secret", help="Discord OAuth app client secret -- keep "
                                                       "this out of shell history/version control; "

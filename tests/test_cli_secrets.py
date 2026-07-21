@@ -93,6 +93,27 @@ class ApplyEnvSecretsTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             apply_env_secrets(_args(), environ={"ARD_MIN_DISCORD_AGE_DAYS": "soon"})
 
+    def test_ownership_proof_defaults_true_with_no_cli_or_env(self):
+        args = apply_env_secrets(_args(), environ={})
+        self.assertTrue(args.require_ownership_proof)
+        self.assertTrue(args.presence_check)
+
+    def test_ownership_proof_env_can_disable(self):
+        args = apply_env_secrets(_args(), environ={"ARD_REQUIRE_OWNERSHIP_PROOF": "0",
+                                                    "ARD_PRESENCE_CHECK": "false"})
+        self.assertFalse(args.require_ownership_proof)
+        self.assertFalse(args.presence_check)
+
+    def test_ownership_proof_cli_false_wins_over_env_true(self):
+        args = apply_env_secrets(_args(require_ownership_proof=False),
+                                  environ={"ARD_REQUIRE_OWNERSHIP_PROOF": "1"})
+        self.assertFalse(args.require_ownership_proof, "an explicit CLI False must not be "
+                                                        "overridden by env")
+
+    def test_ownership_proof_bad_env_value_exits(self):
+        with self.assertRaises(SystemExit):
+            apply_env_secrets(_args(), environ={"ARD_REQUIRE_OWNERSHIP_PROOF": "sometimes"})
+
     def test_ntfy_cli_wins_over_env(self):
         args = apply_env_secrets(_args(ntfy_url="https://cli.test/t", ntfy_token="cli-tk"),
                                   environ={"ARD_NTFY_URL": "https://env.test/t",
