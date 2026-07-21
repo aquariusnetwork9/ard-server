@@ -3,9 +3,13 @@ import { config } from './config';
 import * as linkCommand from './discord/commands/link';
 import * as setupCommand from './discord/commands/setup';
 import * as cleanupCommand from './discord/commands/cleanup';
+import * as creditCommand from './discord/commands/credit';
+import * as leaderboardCommand from './discord/commands/leaderboard';
 import { TRAVELER_ROLE } from './discord/provision/structure';
 import { claimSession, isCurrentSession } from './runtime-lock';
 import { startDispatchPolling, handleDispatchButton } from './discord/dispatch/poller';
+import { startRadarPolling } from './discord/dispatch/radar';
+import { startTiersSync } from './discord/dispatch/tiers';
 
 interface Command {
   data: { name: string; toJSON: () => unknown };
@@ -13,7 +17,7 @@ interface Command {
 }
 
 const commands: Collection<string, Command> = new Collection();
-for (const cmd of [linkCommand, setupCommand, cleanupCommand]) {
+for (const cmd of [linkCommand, setupCommand, cleanupCommand, creditCommand, leaderboardCommand]) {
   commands.set(cmd.data.name, cmd);
 }
 
@@ -60,6 +64,8 @@ client.once('ready', async () => {
     console.error('[commands] Failed to register slash commands:', err);
   }
   startDispatchPolling(client);
+  startRadarPolling(client);
+  startTiersSync(client);
 });
 
 client.on('guildMemberAdd', async member => {

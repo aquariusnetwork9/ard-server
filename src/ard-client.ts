@@ -113,3 +113,73 @@ export async function roadName(server: string, roadIdx: number | null): Promise<
   }
   return geometryCache.roads.find(r => r.i === roadIdx)?.name ?? `road #${roadIdx}`;
 }
+
+export class ArdCreditsError extends Error {}
+
+/** Bot-authenticated GET/POST with an arbitrary JSON body -- like
+ *  dispatchRequest above, but not limited to the `{discordId}` shape, since
+ *  credit-opt-in needs `{discordId, server, optIn}` and the leaderboard/radar
+ *  reads are GETs with query params instead of a body at all. */
+async function ardRequest(path: string, method: string, body?: unknown): Promise<any> {
+  const resp = await fetch(`${config.ard.baseUrl}${path}`, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: config.ard.botSecret,
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const parsed: any = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new ArdCreditsError(parsed?.error ?? `ARD returned ${resp.status}`);
+  }
+  return parsed;
+}
+
+/** POST /link/credit-opt-in -- flips whether an already-linked Discord identity's
+ *  confirmed Tier B reports earn a permanent Survey-leaderboard credit (see
+ *  identity.py's credit_opt_in, PROTOCOL.md SS6.7). Off by default; callers
+ *  (the /credit command) are responsible for disclosing what opting in means
+ *  before calling this. */
+export async function setCreditOptIn(discordId: string, server: string, optIn: boolean): Promise<void> {
+  await ardRequest('/link/credit-opt-in', 'POST', { discordId, server, optIn });
+}
+
+export interface LeaderboardEntry {
+  discordId: string;
+  count: number;
+}
+
+/** GET /credits/<server>/leaderboard -- `kind` picks Survey (confirmed reports)
+ *  vs Road Crew (completed repairs); `sinceMs`, if given, scopes to a single
+ *  weekly/monthly race instead of the lifetime total. */
+export async function getLeaderboard(
+  server: string, kind: 'survey' | 'crew', sinceMs?: number
+): Promise<LeaderboardEntry[]> {
+  const qs = new URLSearchParams({ kind });
+  if (sinceMs !== undefined) qs.set('since', String(sinceMs / 1000));
+  const body = await ardRequest(`/credits/${server}/leaderboard?${qs}`, 'GET');
+  return (body.leaderboard ?? []) as LeaderboardEntry[];
+}
+
+export interface ConditionEntry {
+  road: number | null;
+  seg: number;
+  along: number;
+  cond: string;
+  tier: 'A' | 'M' | 'B' | 'C';
+  reports: number;
+  distinctSources: number;
+  confidence: number;
+  published: boolean;
+  firstSeen: number;
+  lastSeen: number;
+}
+
+/** GET /conditions/<server>/all -- the bot/moderator-only radar feed, the one
+ *  place unpublished (not-yet-corroborated) conditions are readable at all; the
+ *  public /conditions/<server> never includes them (PROTOCOL.md SS6.7). */
+export async function getAllConditions(server: string): Promise<ConditionEntry[]> {
+  const body = await ardRequest(`/conditions/${server}/all`, 'GET');
+  return (body.conditions ?? []) as ConditionEntry[];
+}

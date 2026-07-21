@@ -53,6 +53,17 @@ export function buildFaqEmbed(verifyChannelId?: string): EmbedBuilder {
           'no manual "type it in Discord" path today. See the map for what\'s currently reported.',
       },
       {
+        name: 'What are the Survey / Road Crew ranks and the leaderboard?',
+        value:
+          'Cosmetic-only recognition for contributing -- Survey tracks confirmed reports, Road Crew ' +
+          'tracks completed dispatch repairs. They carry no extra channel or dispatch access; they\'re ' +
+          'just a badge. Road Crew always counts (a dispatch claim is never anonymous). Survey credit is ' +
+          '**opt-in only** (`/credit on <server>`, off by default) -- opting in means your real Discord ID ' +
+          'is permanently recorded against every confirmed report you make from then on, specifically so ' +
+          'it can be attributed to you on the leaderboard. That record is kept even if you later run ' +
+          '`/credit off` -- opting out only stops *future* reports from being credited. See `/leaderboard`.',
+      },
+      {
         name: "Can I get help if I'm stuck or something looks wrong?",
         value: 'Ask in your community\'s -help channel, or ping Highway Patrol directly.',
       },

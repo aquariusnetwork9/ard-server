@@ -88,6 +88,49 @@ export function buildReadOnlyOverwrites(
   return overwrites;
 }
 
+/**
+ * Composes buildOverwrites' ViewChannel narrowing with buildReadOnlyOverwrites'
+ * SendMessages restriction on the SAME channel -- e.g. the Dispatch Center's
+ * queue channels, each both narrower than their (now-broadened) category
+ * default AND post-only-by-staff. Calling the two functions above separately
+ * and concatenating their arrays would emit two different overwrite entries
+ * for the same role id (one from each), which permissionOverwrites.set() can't
+ * reconcile -- this merges allow/deny bits per id instead, so every role gets
+ * exactly one overwrite entry covering both permissions.
+ */
+export function buildComposedOverwrites(
+  everyoneId: string, allowedView: string[], categoryScope: string[],
+  staffRoleNames: string[], roleByName: Map<string, Role>
+): OverwriteResolvable[] {
+  const perId = new Map<string, { allow: bigint[]; deny: bigint[] }>();
+  const bump = (id: string, kind: 'allow' | 'deny', perm: bigint) => {
+    const entry = perId.get(id) ?? { allow: [], deny: [] };
+    entry[kind].push(perm);
+    perId.set(id, entry);
+  };
+
+  if (allowedView.includes('everyone')) {
+    bump(everyoneId, 'allow', PermissionFlagsBits.ViewChannel);
+  } else {
+    bump(everyoneId, 'deny', PermissionFlagsBits.ViewChannel);
+    for (const roleName of new Set([...categoryScope, ...allowedView])) {
+      const role = roleByName.get(roleName);
+      if (!role) continue;
+      bump(role.id, allowedView.includes(roleName) ? 'allow' : 'deny', PermissionFlagsBits.ViewChannel);
+    }
+  }
+
+  bump(everyoneId, 'deny', PermissionFlagsBits.SendMessages);
+  for (const roleName of staffRoleNames) {
+    const role = roleByName.get(roleName);
+    if (role) bump(role.id, 'allow', PermissionFlagsBits.SendMessages);
+  }
+
+  return [...perId.entries()].map(([id, { allow, deny }]) => ({
+    id, ...(allow.length ? { allow } : {}), ...(deny.length ? { deny } : {}),
+  }));
+}
+
 export type Outcome = 'created' | 'renamed' | 'existing';
 
 /**

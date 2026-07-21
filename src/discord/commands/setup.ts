@@ -14,7 +14,7 @@ import {
 } from 'discord.js';
 import {
   requireAdmin, findOrCreateRole, findOrCreateCategory, findOrCreateTextChannel,
-  buildOverwrites, buildReadOnlyOverwrites,
+  buildOverwrites, buildReadOnlyOverwrites, buildComposedOverwrites,
 } from './_utils';
 import { ROLES, CATEGORIES } from '../provision/structure';
 import { buildRulesEmbed } from '../provision/rules';
@@ -106,17 +106,16 @@ async function runSetup(interaction: ChatInputCommandInteraction, guild: NonNull
     for (const ch of cat.channels) {
       // A channel with its own visibleTo narrows below the category default
       // (e.g. Barracks under Staff, visible to Highway Patrol + Director but
-      // not Branch Director). A `readOnly` channel keeps the category's
-      // visibility but denies SendMessages to everyone except staff. Neither
-      // set means it just inherits the category as-is. The two aren't
-      // currently composable (buildOverwrites only touches ViewChannel,
-      // buildReadOnlyOverwrites only touches SendMessages) -- fail loudly
-      // here rather than silently dropping readOnly if a future entry ever
-      // sets both, since nothing in the type system prevents it.
-      if (ch.visibleTo && ch.readOnly) {
-        throw new Error(`ChannelSpec "${ch.name}" sets both visibleTo and readOnly -- not supported yet`);
-      }
-      const chOverwrites = ch.visibleTo
+      // not Branch Director). A `readOnly` channel denies SendMessages to
+      // everyone except staff. Both together (e.g. Dispatch Center's queue
+      // channels: narrower than the Worker-and-up category default AND
+      // post-only-by-staff) go through buildComposedOverwrites, which merges
+      // both permissions per role instead of emitting two conflicting
+      // overwrite entries for the same id. Neither set means it just
+      // inherits the category's visibility as-is.
+      const chOverwrites = ch.visibleTo && ch.readOnly
+        ? buildComposedOverwrites(everyoneId, ch.visibleTo, cat.visibleTo, STAFF_ROLES_FOR_MODERATION, roleByName)
+        : ch.visibleTo
         ? buildOverwrites(everyoneId, ch.visibleTo, cat.visibleTo, roleByName)
         : ch.readOnly
         ? buildReadOnlyOverwrites(everyoneId, STAFF_ROLES_FOR_MODERATION, roleByName)

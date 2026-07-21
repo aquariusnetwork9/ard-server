@@ -36,6 +36,71 @@ export interface RoleSpec {
 
 export const TRAVELER_ROLE = 'Traveler';
 
+// Bare per-server display prefix (no " Highway Worker" suffix) -- used to build the
+// Survey/Road Crew tier and rotating-badge role names below and the radar channel
+// names further down, none of which are part of the trust-tier role family
+// SERVER_ROLE (declared later in this file) maps.
+const SERVER_PREFIX: Record<string, string> = {
+  '2b2t.org': '2b2t',
+  '6b6t.org': '6b6t',
+};
+
+// Survey (confirmed hazard reports) and Road Crew (completed dispatch repairs) --
+// cosmetic contribution ladders siloed per server, same as every trust concept in
+// this file. Tiers STACK (every tier earned is kept, never swapped -- see
+// discord/dispatch/tiers.ts) and carry ZERO channel/dispatch privilege of their
+// own: report/repair volume is never conflated with trust. Thresholds are lifetime
+// counts on that one server (ARD's own /credits/<server>/leaderboard is already
+// siloed the same way).
+export const SURVEY_TIER_NAMES = ['Survey Tech', 'Surveyor', 'Senior Surveyor', 'Chief Surveyor'];
+export const CREW_TIER_NAMES = ['Crew Member', 'Crew Leader', 'Foreman', 'Superintendent'];
+export const TIER_THRESHOLDS = [10, 20, 50, 100];
+
+const SURVEY_TIER_COLORS = [0x74b9ff, 0x2e86de, 0x1b4f9c, 0x0a2a5e]; // light -> dark blue
+const CREW_TIER_COLORS = [0xffb74d, 0xf57c00, 0x9a5b13, 0x5d3a1a];   // light -> dark amber/brown
+const ROTATING_BADGE_COLOR = 0xffd700; // gold, for every weekly/monthly top badge
+
+export type Track = 'survey' | 'crew';
+export type Cadence = 'weekly' | 'monthly';
+
+/** e.g. tierRoleName('2b2t.org', 'survey', 2) -> "2b2t Senior Surveyor". Shared by
+ *  this file's own role generation below and tiers.ts's role-sync job, so the two
+ *  can never drift apart on naming. */
+export function tierRoleName(server: string, track: Track, tierIndex: number): string {
+  const names = track === 'survey' ? SURVEY_TIER_NAMES : CREW_TIER_NAMES;
+  return `${SERVER_PREFIX[server]} ${names[tierIndex]}`;
+}
+
+/** e.g. rotatingBadgeName('2b2t.org', 'crew', 'weekly') -> "2b2t Weekly Top Crew". */
+export function rotatingBadgeName(server: string, track: Track, cadence: Cadence): string {
+  const label = track === 'survey' ? 'Scout' : 'Crew';
+  const cadenceLabel = cadence === 'weekly' ? 'Weekly' : 'Monthly';
+  return `${SERVER_PREFIX[server]} ${cadenceLabel} Top ${label}`;
+}
+
+const CADENCES: Cadence[] = ['weekly', 'monthly'];
+const TRACKS: Track[] = ['survey', 'crew'];
+
+// The 16 tier roles (4 tiers x 2 tracks x 2 servers) + 8 rotating badges (2
+// cadences x 2 tracks x 2 servers) generated from the naming helpers above, so
+// there's exactly one place that ever spells out a tier/badge role name.
+const GENERATED_CONTRIBUTION_ROLES: RoleSpec[] = [];
+for (const server of Object.keys(SERVER_PREFIX)) {
+  SURVEY_TIER_NAMES.forEach((_, i) => GENERATED_CONTRIBUTION_ROLES.push({
+    name: tierRoleName(server, 'survey', i), color: SURVEY_TIER_COLORS[i], hoist: true,
+  }));
+  CREW_TIER_NAMES.forEach((_, i) => GENERATED_CONTRIBUTION_ROLES.push({
+    name: tierRoleName(server, 'crew', i), color: CREW_TIER_COLORS[i], hoist: true,
+  }));
+  for (const cadence of CADENCES) {
+    for (const track of TRACKS) {
+      GENERATED_CONTRIBUTION_ROLES.push({
+        name: rotatingBadgeName(server, track, cadence), color: ROTATING_BADGE_COLOR, hoist: true,
+      });
+    }
+  }
+}
+
 export const ROLES: RoleSpec[] = [
   { name: TRAVELER_ROLE, color: 0x99aab5, hoist: false },
   { name: '2b2t Highway Worker', color: 0x57f287, hoist: true, oldNames: ['2b2t Verified'] },
@@ -52,6 +117,11 @@ export const ROLES: RoleSpec[] = [
   { name: 'Highway Patrol', color: 0xed4245, hoist: true, oldNames: ['Moderator'] },
   { name: 'Director', color: 0x9b59b6, hoist: true },
   { name: 'Branch Director', color: 0x71368a, hoist: true },
+  // Survey/Road Crew tiers + weekly/monthly rotating badges -- see the generation
+  // loop above tierRoleName/rotatingBadgeName. Deliberately absent from every
+  // CategorySpec.visibleTo below: these are pure badges with no channel or
+  // dispatch access of their own.
+  ...GENERATED_CONTRIBUTION_ROLES,
 ];
 
 // Who can see/use the Dispatch Center category (structure below): every
@@ -77,6 +147,16 @@ export const DISPATCH_CHANNEL_NAMES = {
   records: '📜・records',
 } as const;
 
+// Per-server situational-awareness channel, open to that server's Worker rank and
+// up -- unlike the dispatch-queue channels above, this is NOT gated to
+// DISPATCH_ACCESS_ROLES (see the Dispatch Center category's own visibleTo below,
+// which is broadened for exactly these two channels and narrowed back down again
+// per-channel for the queue channels). Shared with discord/dispatch/radar.ts the
+// same way DISPATCH_CHANNEL_NAMES is shared with poller.ts.
+export function radarChannelName(server: string): string {
+  return `📡・${SERVER_PREFIX[server]}-radar`;
+}
+
 // Maps the ARD `server` field (from /link/bot-complete's response) to the
 // Discord role /link grants automatically.
 export const SERVER_ROLE: Record<string, string> = {
@@ -95,9 +175,10 @@ export interface ChannelSpec {
   oldNames?: string[];
   // Narrows visibility below the category default -- roles in the category's
   // own visibleTo that aren't listed here are explicitly denied on this one
-  // channel. Omit to just inherit the category's visibility as-is. Mutually
-  // exclusive with `readOnly` (visibility vs. who can post are separate axes,
-  // but nothing here currently needs both narrowed at once).
+  // channel. Omit to just inherit the category's visibility as-is. Composable
+  // with `readOnly` (setup.ts's buildComposedOverwrites merges both onto the
+  // same role) -- e.g. Dispatch Center's queue channels are both narrower
+  // than the category default AND post-only-by-staff.
   visibleTo?: string[];
   // Anyone who can view this channel may still not post in it, except the
   // staff roles in moderation.ts's STAFF_ROLES_FOR_MODERATION.
@@ -165,28 +246,49 @@ export const CATEGORIES: CategorySpec[] = [
   },
   {
     name: '🛰️ Dispatch Center',
-    // See DISPATCH_ACCESS_ROLES's own comment for why Highway Inspector is
-    // listed directly here, unlike everywhere else in this file.
-    visibleTo: [...DISPATCH_ACCESS_ROLES, ...STAFF_ROLES],
+    // Broadened to Worker-and-up so the two radar channels below (situational
+    // awareness, everyone's business) can live in this category too -- the
+    // actual dispatch-queue channels (open/barracks/closed/records) each carry
+    // their own narrower visibleTo below to claw back down to dispatch-roles
+    // only; they must NOT inherit this wider category default. See
+    // DISPATCH_ACCESS_ROLES's own comment for why Highway Inspector is listed
+    // directly here, unlike everywhere else in this file.
+    visibleTo: ['2b2t Highway Worker', '6b6t Highway Worker', ...DISPATCH_ACCESS_ROLES, ...STAFF_ROLES],
     channels: [
       {
         name: DISPATCH_CHANNEL_NAMES.open,
         topic: 'Open dispatch targets -- claim one with the button on its post.',
         readOnly: true,
+        visibleTo: [...DISPATCH_ACCESS_ROLES, ...STAFF_ROLES],
       },
       {
         name: DISPATCH_CHANNEL_NAMES.barracks,
         topic: 'Coordination for whoever\'s actively out on a claim.',
+        visibleTo: [...DISPATCH_ACCESS_ROLES, ...STAFF_ROLES],
       },
       {
         name: DISPATCH_CHANNEL_NAMES.closed,
         topic: 'Recently resolved dispatch targets.',
         readOnly: true,
+        visibleTo: [...DISPATCH_ACCESS_ROLES, ...STAFF_ROLES],
       },
       {
         name: DISPATCH_CHANNEL_NAMES.records,
         topic: 'Full dispatch audit log -- every claim, completion, and expiry.',
         readOnly: true,
+        visibleTo: [...DISPATCH_ACCESS_ROLES, ...STAFF_ROLES],
+      },
+      {
+        name: radarChannelName('2b2t.org'),
+        topic: 'Live 2b2t road-condition situational awareness -- every report, not just the promoted dispatch queue.',
+        readOnly: true,
+        visibleTo: ['2b2t Highway Worker', '2b2t Highway Supervisor', 'Highway Inspector', 'Dispatcher', ...STAFF_ROLES],
+      },
+      {
+        name: radarChannelName('6b6t.org'),
+        topic: 'Live 6b6t road-condition situational awareness -- every report, not just the promoted dispatch queue.',
+        readOnly: true,
+        visibleTo: ['6b6t Highway Worker', '6b6t Highway Supervisor', 'Highway Inspector', 'Dispatcher', ...STAFF_ROLES],
       },
     ],
   },
