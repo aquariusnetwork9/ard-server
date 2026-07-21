@@ -1016,9 +1016,12 @@ class TrustedWriteCapTests(unittest.TestCase):
 
 
 class DispatchHttpTests(unittest.TestCase):
-    """SS6.5: auth surface for the dispatch queue -- fleet (A/M token) polls and
-    claims, moderator can view/manually-enqueue/force-complete, neither can do
-    the other's job. Own class/server: a dedicated fresh Store."""
+    """SS6.7: auth surface for the dispatch queue -- fleet (A/M token) polls and
+    claims, moderator can view/manually-enqueue/force-complete, the first-party
+    bot can act on behalf of a Discord identity it vouches for (Highway
+    Bot -- the Discord-role gating itself lives entirely bot-side, ARD only
+    ever sees "the bot says this discordId"). Own class/server: a dedicated
+    fresh Store."""
 
     @classmethod
     def setUpClass(cls):
@@ -1027,7 +1030,9 @@ class DispatchHttpTests(unittest.TestCase):
         registry.issue("dispatch-bot", "test-owner", trust.SCOPE_FULL, SERVER, token=FULL_TOKEN)
         registry.issue("dispatch-crew", "test-owner", trust.SCOPE_MAINTAINER, SERVER, token=MAINTAINER_TOKEN)
         registry.issue("dispatch-mod", "test-owner", trust.SCOPE_MODERATOR, SERVER, token=MODERATOR_TOKEN)
-        auth = Auth(registry, links=None, owner_hashes={Auth.hash_token(OWNER_TOKEN)})
+        registry.grant_to_discord("discord-dispatch-mod", trust.SCOPE_MODERATOR, SERVER, "test-owner")
+        auth = Auth(registry, links=None, owner_hashes={Auth.hash_token(OWNER_TOKEN)},
+                    bot_hashes={Auth.hash_token(BOT_TOKEN)})
         cls.app = App(store, auth)
         cls.srv = Server(("127.0.0.1", 0), cls.app)
         cls.port = cls.srv.server_address[1]
@@ -1056,7 +1061,7 @@ class DispatchHttpTests(unittest.TestCase):
         return body["id"]
 
     def test_manual_enqueue_requires_moderator_scope(self):
-        r = self.a_report(9010)
+        r = self.a_report(9000)
         payload = {"road": r["road"], "seg": r["seg"], "along": r["along"]}
         self.assertEqual(
             req("POST", self.url(f"/dispatch/{SERVER}/queue"), token=FULL_TOKEN, body=payload)[0], 403)
@@ -1064,15 +1069,15 @@ class DispatchHttpTests(unittest.TestCase):
             req("POST", self.url(f"/dispatch/{SERVER}/queue"), token=NOBODY_TOKEN, body=payload)[0], 403)
 
     def test_list_requires_fleet_or_moderator_scope(self):
-        self.manual_enqueue(9020)
+        self.manual_enqueue(9300)
         self.assertEqual(req("GET", self.url(f"/dispatch/{SERVER}"), token=NOBODY_TOKEN)[0], 403)
         code, body = req("GET", self.url(f"/dispatch/{SERVER}"), token=FULL_TOKEN)
         self.assertEqual(code, 200)
-        self.assertTrue(any(e["along"] == self.a_report(9020)["along"] for e in body["queue"]))
+        self.assertTrue(any(e["along"] == self.a_report(9300)["along"] for e in body["queue"]))
         self.assertEqual(req("GET", self.url(f"/dispatch/{SERVER}"), token=MODERATOR_TOKEN)[0], 200)
 
     def test_claim_requires_an_am_token_not_moderator(self):
-        did = self.manual_enqueue(9030)
+        did = self.manual_enqueue(9600)
         self.assertEqual(
             req("POST", self.url(f"/dispatch/{did}/claim"), token=MODERATOR_TOKEN)[0], 403)
         self.assertEqual(
@@ -1082,7 +1087,7 @@ class DispatchHttpTests(unittest.TestCase):
         self.assertTrue(body["claimed"])
 
     def test_double_claim_is_409(self):
-        did = self.manual_enqueue(9040)
+        did = self.manual_enqueue(9900)
         req("POST", self.url(f"/dispatch/{did}/claim"), token=FULL_TOKEN)
         code, body = req("POST", self.url(f"/dispatch/{did}/claim"), token=MAINTAINER_TOKEN)
         self.assertEqual(code, 409)
@@ -1092,7 +1097,7 @@ class DispatchHttpTests(unittest.TestCase):
         self.assertEqual(code, 404)
 
     def test_complete_by_a_different_token_without_moderator_scope_is_409(self):
-        did = self.manual_enqueue(9050)
+        did = self.manual_enqueue(10200)
         req("POST", self.url(f"/dispatch/{did}/claim"), token=FULL_TOKEN)
         code, _ = req("POST", self.url(f"/dispatch/{did}/complete"), token=MAINTAINER_TOKEN)
         self.assertEqual(code, 409)
@@ -1101,21 +1106,21 @@ class DispatchHttpTests(unittest.TestCase):
         self.assertTrue(body["completed"])
 
     def test_moderator_can_force_complete_someone_elses_claim(self):
-        did = self.manual_enqueue(9060)
+        did = self.manual_enqueue(10500)
         req("POST", self.url(f"/dispatch/{did}/claim"), token=FULL_TOKEN)
         code, body = req("POST", self.url(f"/dispatch/{did}/complete"), token=MODERATOR_TOKEN)
         self.assertEqual(code, 200)
         self.assertTrue(body["completed"])
 
     def test_owner_can_force_complete_too(self):
-        did = self.manual_enqueue(9070)
+        did = self.manual_enqueue(10800)
         req("POST", self.url(f"/dispatch/{did}/claim"), token=MAINTAINER_TOKEN)
         code, body = req("POST", self.url(f"/dispatch/{did}/complete"), token=OWNER_TOKEN)
         self.assertEqual(code, 200)
         self.assertTrue(body["completed"])
 
     def test_complete_unclaimed_entry_is_409(self):
-        did = self.manual_enqueue(9080)
+        did = self.manual_enqueue(11100)
         code, _ = req("POST", self.url(f"/dispatch/{did}/complete"), token=FULL_TOKEN)
         self.assertEqual(code, 409)
 
@@ -1124,6 +1129,66 @@ class DispatchHttpTests(unittest.TestCase):
         payload = {"road": 0, "seg": 0, "along": 0}
         self.assertEqual(
             req("POST", self.url(f"/dispatch/{SERVER2}/queue"), token=MODERATOR_TOKEN, body=payload)[0], 403)
+
+    # ---- bot-mediated (Discord) access, SS6.7 ----
+    def test_bot_can_list_without_a_discord_id(self):
+        # Listing is just polling to render the Discord queue view -- no
+        # per-actor identity needed, unlike claim/complete.
+        self.manual_enqueue(11400)
+        code, _ = req("GET", self.url(f"/dispatch/{SERVER}"), token=BOT_TOKEN)
+        self.assertEqual(code, 200)
+
+    def test_bot_claim_without_discord_id_is_403(self):
+        did = self.manual_enqueue(11700)
+        code, _ = req("POST", self.url(f"/dispatch/{did}/claim"), token=BOT_TOKEN, body={})
+        self.assertEqual(code, 403)
+
+    def test_bot_can_claim_on_behalf_of_a_discord_identity(self):
+        did = self.manual_enqueue(12000)
+        code, body = req("POST", self.url(f"/dispatch/{did}/claim"), token=BOT_TOKEN,
+                         body={"discordId": "discord-volunteer-1"})
+        self.assertEqual(code, 200)
+        self.assertTrue(body["claimed"])
+        # A registry-scoped token can't then also claim the same entry.
+        self.assertEqual(req("POST", self.url(f"/dispatch/{did}/claim"), token=FULL_TOKEN)[0], 409)
+
+    def test_a_random_token_cannot_impersonate_the_bot(self):
+        # Presenting a discordId only matters when the CALLER is the bot
+        # itself (proven by ARD_BOT_SECRET) -- an arbitrary token can't just
+        # tack a discordId onto the body to bypass the registry-token check.
+        did = self.manual_enqueue(12300)
+        code, _ = req("POST", self.url(f"/dispatch/{did}/claim"), token=NOBODY_TOKEN,
+                      body={"discordId": "discord-volunteer-1"})
+        self.assertEqual(code, 403)
+
+    def test_bot_can_complete_its_own_claim(self):
+        did = self.manual_enqueue(12600)
+        req("POST", self.url(f"/dispatch/{did}/claim"), token=BOT_TOKEN,
+            body={"discordId": "discord-volunteer-2"})
+        code, body = req("POST", self.url(f"/dispatch/{did}/complete"), token=BOT_TOKEN,
+                         body={"discordId": "discord-volunteer-2"})
+        self.assertEqual(code, 200)
+        self.assertTrue(body["completed"])
+
+    def test_bot_cannot_complete_a_different_discord_identitys_claim(self):
+        did = self.manual_enqueue(12900)
+        req("POST", self.url(f"/dispatch/{did}/claim"), token=BOT_TOKEN,
+            body={"discordId": "discord-volunteer-3"})
+        code, _ = req("POST", self.url(f"/dispatch/{did}/complete"), token=BOT_TOKEN,
+                      body={"discordId": "discord-someone-else"})
+        self.assertEqual(code, 409)
+
+    def test_bot_can_force_complete_for_a_discord_moderator_grant(self):
+        # discord-dispatch-mod holds a discord_grants moderator scope on
+        # SERVER (see setUpClass) -- the bot vouching for THAT identity can
+        # force-close someone else's claim, same as a moderator token/session.
+        did = self.manual_enqueue(13200)
+        req("POST", self.url(f"/dispatch/{did}/claim"), token=BOT_TOKEN,
+            body={"discordId": "discord-volunteer-4"})
+        code, body = req("POST", self.url(f"/dispatch/{did}/complete"), token=BOT_TOKEN,
+                         body={"discordId": "discord-dispatch-mod"})
+        self.assertEqual(code, 200)
+        self.assertTrue(body["completed"])
 
 
 

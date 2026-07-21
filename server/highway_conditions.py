@@ -1411,16 +1411,25 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _require_fleet_for(self, server):
-        """A live registry token scoped 'full' (Tier A) or 'maintainer' (Tier M)
-        on this server -- the same credential /report already authenticates
-        A/M writes with. Returns (token_id, scope), or None after already
-        responding 403."""
+    def _dispatch_actor(self, server, discord_id=None):
+        """Who's allowed to act on a dispatch entry for `server`: a live A/M
+        registry token (the same credential /report already authenticates A/M
+        writes with), or -- given a discordId -- the first-party bot vouching
+        for that Discord identity (PROTOCOL.md SS6.7: the bot is the sole
+        arbiter of any Discord-role gating -- Highway Supervisor/Inspector, or
+        a staff-granted Dispatcher role -- checked against its own gateway
+        member cache; ARD itself never touches Discord roles, the same trust
+        boundary /link/bot-complete already draws for a bot-supplied
+        discordId). Returns an actor id ("tok:<id>" or "discord:<discord_id>"),
+        or None if neither credential is present -- not itself an error
+        response, since callers combine this differently (list/complete have
+        their own fallbacks, claim doesn't)."""
         creds = self.app.auth.write_credentials(self._token(), server)
-        if creds is None or creds[1] not in (trust.SCOPE_FULL, trust.SCOPE_MAINTAINER):
-            self._json(403, {"error": "a registry-scoped (A/M) token is required for this server"})
-            return None
-        return creds
+        if creds is not None and creds[1] in (trust.SCOPE_FULL, trust.SCOPE_MAINTAINER):
+            return "tok:" + creds[0]
+        if discord_id and self.app.auth.is_bot(self._token()):
+            return "discord:" + discord_id
+        return None
 
     def _require_admin_for(self, server):
         if self.app.auth.is_owner(self._token()):
@@ -1646,19 +1655,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": str(e)})
         self._json(200 if ok else 404, {"quashed": ok})
 
-    # ---- dispatch queue (PROTOCOL.md SS6.5) ----
+    # ---- dispatch queue (PROTOCOL.md SS6.7) ----
     def _dispatch_list(self, server):
         # Fleet (A/M token, same credential /report uses) polls to work the
-        # queue; moderator/admin can also view it for visibility, but only a
-        # fleet-scoped token can claim (see _dispatch_claim).
+        # queue; the first-party bot also polls this to render the Discord
+        # queue view (SS6.7); moderator/admin can view for visibility too.
+        # Only a fleet token or the bot (on a Discord identity's behalf) can
+        # actually claim -- see _dispatch_claim.
         creds = self.app.auth.write_credentials(self._token(), server)
         is_fleet = creds is not None and creds[1] in (trust.SCOPE_FULL, trust.SCOPE_MAINTAINER)
         scopes = self._caller_scopes(server)
         is_mod = self.app.auth.is_owner(self._token()) or \
             trust.SCOPE_MODERATOR in scopes or trust.SCOPE_ADMIN in scopes
-        if not (is_fleet or is_mod):
-            return self._json(403, {"error": "a registry-scoped (A/M) token or moderator "
-                                              "scope is required for this server"})
+        is_bot = self.app.auth.is_bot(self._token())
+        if not (is_fleet or is_mod or is_bot):
+            return self._json(403, {"error": "a registry-scoped (A/M) token, moderator "
+                                              "scope, or the bot credential is required "
+                                              "for this server"})
         try:
             queue = self.app.store.list_dispatch(server)
         except KeyError:
@@ -1686,10 +1699,18 @@ class Handler(BaseHTTPRequestHandler):
         server = self.app.store.dispatch_server(did)
         if server is None:
             return self._json(404, {"error": "not found"})
-        creds = self._require_fleet_for(server)
-        if creds is None:
-            return
-        result = self.app.store.claim_dispatch(did, creds[0])
+        try:
+            raw = self._read_body()
+            body = json.loads(raw) if raw else {}
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "bad json"})
+        # discordId is only meaningful for the bot's own credential (a fleet
+        # token needs nothing else) -- see _dispatch_actor.
+        actor = self._dispatch_actor(server, body.get("discordId"))
+        if actor is None:
+            return self._json(403, {"error": "a registry-scoped (A/M) token, or the bot "
+                                              "credential with a discordId, is required"})
+        result = self.app.store.claim_dispatch(did, actor)
         if result is None:
             return self._json(404, {"error": "not found"})
         if not result:
@@ -1700,16 +1721,29 @@ class Handler(BaseHTTPRequestHandler):
         server = self.app.store.dispatch_server(did)
         if server is None:
             return self._json(404, {"error": "not found"})
-        # Either the claimant's own token, or a moderator/owner overriding it
-        # (a stuck or abandoned claim someone needs to force-close).
+        try:
+            raw = self._read_body()
+            body = json.loads(raw) if raw else {}
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "bad json"})
+        discord_id = body.get("discordId")
+        # Either the claimant's own actor id, or a moderator/owner overriding
+        # it (a stuck or abandoned claim someone needs to force-close).
         scopes = self._caller_scopes(server)
         force = self.app.auth.is_owner(self._token()) or \
             trust.SCOPE_MODERATOR in scopes or trust.SCOPE_ADMIN in scopes
-        creds = self.app.auth.write_credentials(self._token(), server)
-        token_id = creds[0] if creds and creds[1] in (trust.SCOPE_FULL, trust.SCOPE_MAINTAINER) else None
-        if not force and token_id is None:
-            return self._json(403, {"error": "a claimant token or moderator scope is required"})
-        result = self.app.store.complete_dispatch(did, token_id, force=force)
+        actor = self._dispatch_actor(server, discord_id)
+        if not force and discord_id and self.app.auth.is_bot(self._token()):
+            # The bot itself is never a moderator; the discordId it's acting
+            # for might be, via a discord_grants moderator/admin grant on this
+            # server -- same lookup _caller_scopes uses for a live dashboard
+            # session, just keyed off the bot-vouched id instead of a cookie.
+            discord_scopes = self.app.auth.registry.discord_scopes(discord_id, server)
+            force = trust.SCOPE_MODERATOR in discord_scopes or trust.SCOPE_ADMIN in discord_scopes
+        if actor is None and not force:
+            return self._json(403, {"error": "a claimant token, moderator scope, or the "
+                                              "bot credential is required"})
+        result = self.app.store.complete_dispatch(did, actor, force=force)
         if result is None:
             return self._json(404, {"error": "not found"})
         if not result:

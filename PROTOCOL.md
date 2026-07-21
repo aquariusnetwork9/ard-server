@@ -582,6 +582,21 @@ before active dispatch (a bot travels specifically to verify) — active dispatc
 high-priority contested entries given how expensive real travel is. This section is server-only;
 the queue exists and is fully functional, nothing yet reads it on the fleet side.
 
+**Human volunteers via Discord (0.1.8):** opened the same queue to Tier B members holding a
+staff-granted Discord role (alongside Tier A/M members, who already have standing via their own
+Discord rank), fronted by Highway Bot rather than raw `curl`. ARD itself never touches Discord
+roles — that check is entirely the bot's own responsibility, against its own gateway member
+cache — so this needed exactly one new auth path, mirroring the trust boundary `/link/bot-complete`
+already draws for a bot-supplied `discordId`: the first-party bot credential (`ARD_BOT_SECRET`)
+plus a `discordId` in the request body is accepted anywhere a fleet token is, with the bot
+vouching that this Discord identity is currently allowed to act. The resulting actor id is
+`"discord:<discordId>"` (parallel to a token holder's `"tok:<token_id>"`) — same `claimed_by`
+column, no schema change. A bot-vouched `discordId` that itself holds a `discord_grants`
+moderator/admin scope on that server can force-complete someone else's claim, exactly like a
+moderator token or dashboard session already can. `GET /dispatch/<server>` also accepts the bare
+bot credential with no `discordId` at all, since listing (to render the queue for humans) isn't
+an action taken on anyone's behalf.
+
 ## 7. Consumption
 
 | route | method | auth | purpose |
@@ -602,10 +617,10 @@ the queue exists and is fully functional, nothing yet reads it on the fleet side
 | `/moderation/quash` | POST | `moderator`/`admin` scope **for that server**, token or session | body `{server, road, seg, along, cond}` — removes a specific published condition outright — §6.5 |
 | `/identity/<server>/<discord_id>/suspend` | POST | `moderator`/`admin` scope **for that server**, token or session | suspend a Tier B (Discord) identity on that server only — §6.5 |
 | `/identity/<server>/<discord_id>/reinstate` | POST | `moderator`/`admin` scope **for that server**, token or session | reinstate a suspended Tier B identity on that server only — §6.5 |
-| `/dispatch/<server>` | GET | `full`/`maintainer` (fleet) token, or `moderator`/`admin` scope, **for that server** | list the open (queued/claimed) dispatch queue — §6.7 |
+| `/dispatch/<server>` | GET | `full`/`maintainer` (fleet) token, `moderator`/`admin` scope, or the bot credential, **for that server** | list the open (queued/claimed) dispatch queue — §6.7 |
 | `/dispatch/<server>/queue` | POST | `moderator`/`admin` scope **for that server**, token or session | body `{road, seg, along}` — manually queue a spot — §6.7 |
-| `/dispatch/<id>/claim` | POST | `full`/`maintainer` (fleet) token **for the entry's own server** | claim a queued entry — §6.7 |
-| `/dispatch/<id>/complete` | POST | the claimant's own token, or `moderator`/`admin` scope for the entry's own server | resolve a claimed entry — §6.7 |
+| `/dispatch/<id>/claim` | POST | `full`/`maintainer` (fleet) token, or the bot credential + body `{discordId}`, **for the entry's own server** | claim a queued entry — §6.7 |
+| `/dispatch/<id>/complete` | POST | the claimant's own token/actor, `moderator`/`admin` scope, or the bot credential + `{discordId}` for the entry's own server | resolve a claimed entry — §6.7 |
 | `/registry` | POST/GET/DELETE | Owner (all servers) or a dashboard `admin` session (own server(s) only) | issue/list/revoke registry tokens of any scope; issuing requires `server` in the body — §6.3/§6.6 |
 | `/admin/login` | POST | none (holds a Discord `discordCode` instead) | exchanges a Discord code for a session cookie, if that identity holds any `discord_grants` — §6.6 |
 | `/admin/logout` | POST | dashboard session | revokes the presented session — §6.6 |
