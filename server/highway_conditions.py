@@ -317,6 +317,12 @@ class Store:
         );
         CREATE UNIQUE INDEX IF NOT EXISTS dispatch_open_key
           ON dispatch(server, road_canon, seg, along) WHERE status IN ('queued','claimed');
+        CREATE TABLE IF NOT EXISTS credits(
+          id INTEGER PRIMARY KEY,
+          server TEXT NOT NULL, cond_id INTEGER NOT NULL, discord_id TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'report', awarded_at REAL NOT NULL,
+          UNIQUE(cond_id, discord_id, kind)
+        );
         """)
         # sources.weight didn't exist before the reputation layer -- ALTER, not
         # CREATE, since a live deployment's DB already has this table without it.
@@ -497,7 +503,7 @@ class Store:
         return oracle.is_present(mc_uid)
 
     # ---- ingest ----
-    def ingest(self, report, source_key, tier, mc_uid=None):
+    def ingest(self, report, source_key, tier, mc_uid=None, credit_id=None):
         """report must already have passed validate_report(). tier is 'A', 'M', 'B',
         or 'C' (see App._report for how a presented token maps to a tier). source_key
         is whatever identifies the reporter for corroboration purposes -- the raw
@@ -507,6 +513,17 @@ class Store:
         shared fleet IP). mc_uid, when known (Tier B only -- a specific linked
         Minecraft account, not the discord_id source_key), is checked against any
         presence oracle configured for this server (see _check_presence).
+
+        credit_id, when given (Tier B only, and only when that identity has opted in
+        via /credit -- see identity.py's credit_opt_in), is the SAME raw discord_id as
+        source_key. It's a separate parameter rather than reusing source_key directly
+        so the opt-in gate stays an explicit decision made by the caller (the HTTP
+        handler, which alone knows the opt-in flag) rather than something this method
+        would otherwise have to re-derive or assume. Whenever this report both counts
+        toward corroboration and lands on a condition that ends up published,
+        credit_id (if given) is recorded permanently in `credits` -- see the
+        module-level privacy note this supersedes for Tier B specifically (Survey
+        leaderboard, PROTOCOL.md SS6.7).
 
         Returns a view dict."""
         server = report["server"]
@@ -604,6 +621,25 @@ class Store:
             # "last known point" per identity) -- see the module-level note.
             if identity_hash is not None and counts_toward_corroboration and view["published"]:
                 self._adjust_trust(identity_hash, TRUST_BOOST, now)
+                self.db.commit()
+            # Survey credit (SS6.7): every opted-in Tier B contributor to a
+            # currently-published condition, not just whoever's report happened to
+            # tip it over the threshold -- real reporters resend periodically (see
+            # HighwayReporterModule's own resend-throttle), so gating on the
+            # post-update `published` state alone means each contributor gets
+            # credited the next time they report while it's still confirmed, not
+            # only the one instant it first crossed. INSERT OR IGNORE (backed by
+            # UNIQUE(cond_id, discord_id, kind)) makes every later resend from the
+            # same person a costless no-op instead of a duplicate row. Only if this
+            # report counted toward corroboration in the first place (a
+            # travel-implausible or presence-failed report shouldn't earn credit).
+            # credit_id is the caller's explicit, already-opt-in-gated signal --
+            # this method never checks the opt-in flag itself.
+            if credit_id is not None and counts_toward_corroboration and view["published"]:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO credits(server, cond_id, discord_id, kind, awarded_at)"
+                    " VALUES(?,?,?,'report',?)",
+                    (server, cond_id, credit_id, now))
                 self.db.commit()
         if reopened:
             self.add_moderation(report, kind="reopen")
@@ -858,6 +894,46 @@ class Store:
             "trigger": r[4], "priority": r[5], "status": r[6], "claimedBy": r[7],
             "created": int(r[8]), "claimedAt": None if r[9] is None else int(r[9]),
         } for r in rows]
+
+    # ---- leaderboards (SS6.7): Survey (confirmed-report credit) and Road Crew
+    # (completed dispatch claims) -- deliberately siloed per server, same as every
+    # other trust/role concept in this project. `since`, when given, scopes to a
+    # single week/month race instead of the lifetime total (same epoch-seconds shape
+    # used everywhere else here). ----
+    def award_leaderboard(self, server, since=None):
+        """[(discord_id, count)] of confirmed-report credits on this server, most
+        first. Reads the `credits` table -- see ingest()'s award-on-first-publish
+        logic. Tier C is never in here at all (credit_id is only ever set for an
+        opted-in Tier B identity)."""
+        with self._lock:
+            if since is None:
+                rows = self.db.execute(
+                    "SELECT discord_id, COUNT(*) FROM credits WHERE server=? AND kind='report'"
+                    " GROUP BY discord_id ORDER BY COUNT(*) DESC", (server,)).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT discord_id, COUNT(*) FROM credits WHERE server=? AND kind='report' AND awarded_at>=?"
+                    " GROUP BY discord_id ORDER BY COUNT(*) DESC", (server, since)).fetchall()
+        return [{"discordId": r[0], "count": r[1]} for r in rows]
+
+    def repair_leaderboard(self, server, since=None):
+        """[(discord_id, count)] of completed dispatch claims on this server, most
+        first. Reads straight off `dispatch` -- complete_dispatch() never clears
+        claimed_by, so a lifetime count needs no separate ledger. Only ever counts
+        a human's own claim (claimed_by prefixed 'discord:') -- a fleet bot's own
+        'tok:'-prefixed completions aren't a person to credit."""
+        with self._lock:
+            if since is None:
+                rows = self.db.execute(
+                    "SELECT claimed_by, COUNT(*) FROM dispatch"
+                    " WHERE server=? AND status='done' AND claimed_by LIKE 'discord:%'"
+                    " GROUP BY claimed_by ORDER BY COUNT(*) DESC", (server,)).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT claimed_by, COUNT(*) FROM dispatch"
+                    " WHERE server=? AND status='done' AND claimed_by LIKE 'discord:%' AND resolved_at>=?"
+                    " GROUP BY claimed_by ORDER BY COUNT(*) DESC", (server, since)).fetchall()
+        return [{"discordId": r[0][len("discord:"):], "count": r[1]} for r in rows]
 
     def dispatch_server(self, did):
         """The `server` a dispatch id belongs to, or None -- same purpose as
@@ -1202,6 +1278,8 @@ _MOD_RESOLVE_RE = re.compile(r"^/moderation/(\d+)/(approve|reject)$")
 _DISPATCH_LIST_RE = re.compile(r"^/dispatch/([^/]+)$")
 _DISPATCH_QUEUE_RE = re.compile(r"^/dispatch/([^/]+)/queue$")
 _DISPATCH_ACTION_RE = re.compile(r"^/dispatch/(\d+)/(claim|complete)$")
+_CREDITS_LEADERBOARD_RE = re.compile(r"^/credits/([^/]+)/leaderboard$")
+_CONDITIONS_ALL_RE = re.compile(r"^/conditions/([^/]+)/all$")
 _REGISTRY_ID_RE = re.compile(r"^/registry/([0-9a-f]{16})$")
 _IDENTITY_ACTION_RE = re.compile(r"^/identity/([^/]+)/([^/]+)/(suspend|reinstate)$")
 _ADMIN_GRANT_ID_RE = re.compile(r"^/admin/grants/([0-9a-f]{16})$")
@@ -1306,6 +1384,12 @@ class Handler(BaseHTTPRequestHandler):
         m = _DISPATCH_LIST_RE.match(path)
         if m:
             return self._dispatch_list(m.group(1))
+        m = _CREDITS_LEADERBOARD_RE.match(path)
+        if m:
+            return self._credits_leaderboard(m.group(1))
+        m = _CONDITIONS_ALL_RE.match(path)
+        if m:
+            return self._conditions_all(m.group(1))
         if path == "/registry":
             return self._registry_list()
         if path == "/link/config":
@@ -1344,6 +1428,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._link_complete()
         if path == "/link/bot-complete":
             return self._link_bot_complete()
+        if path == "/link/credit-opt-in":
+            return self._link_credit_opt_in()
         m = _IDENTITY_ACTION_RE.match(path)
         if m:
             return self._identity_action(m.group(1), m.group(2), m.group(3))
@@ -1474,6 +1560,41 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": str(e)})
         self._json(200, {"server": server, "conditions": rows})
 
+    def _conditions_all(self, server):
+        # Bot/moderator-only counterpart to the public /conditions/<server> above --
+        # that route deliberately NEVER includes unpublished (tentative,
+        # below-corroboration-threshold) rows, since exposing exactly how close a
+        # spot is to crossing the threshold would hand any public reader a live
+        # readout of the corroboration gate itself (see ingest()'s own note on
+        # _broadcast). The Discord bot's radar feed (situational awareness in
+        # #<server>-radar, including a lone unconfirmed Tier C report) is a
+        # legitimately different, privileged audience -- same gating as
+        # _dispatch_list/_credits_leaderboard, not a relaxation of the public gate.
+        scopes = self._caller_scopes(server)
+        is_mod = self.app.auth.is_owner(self._token()) or \
+            trust.SCOPE_MODERATOR in scopes or trust.SCOPE_ADMIN in scopes
+        is_bot = self.app.auth.is_bot(self._token())
+        if not (is_mod or is_bot):
+            return self._json(403, {"error": "the bot credential or moderator/admin scope "
+                                              "is required for this server"})
+        if server not in self.app.store.networks:
+            return self._json(404, {"error": "unknown server"})
+        qs = parse_qs(urlparse(self.path).query)
+
+        def _int(name):
+            return int(qs[name][0]) if name in qs else None
+        try:
+            road = _int("road")
+            frm = _int("from")
+            to = _int("to")
+        except ValueError:
+            return self._json(400, {"error": "bad query param"})
+        try:
+            rows = self.app.store.query(server, road_idx=road, frm=frm, to=to, include_unpublished=True)
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        self._json(200, {"server": server, "conditions": rows})
+
     def _conditions_stream(self, server):
         if not self._rate_limit_read():
             return
@@ -1580,6 +1701,13 @@ class Handler(BaseHTTPRequestHandler):
                         mc_uid = self.app.auth.mc_uid_for(token, server)
                     else:
                         tier, source_key = "C", self._client_ip()
+                # Survey credit (SS6.7): only ever set for an opted-in Tier B
+                # identity -- this is the ONE place the opt-in flag is consulted, so
+                # Store.ingest() never has to know about LinkStore at all.
+                credit_id = None
+                if tier == "B" and self.app.auth.links is not None \
+                        and self.app.auth.links.credit_opt_in_for(source_key, server):
+                    credit_id = source_key
                 if tier in ("A", "M"):
                     # Per-token ceiling (keyed on the holder, not the shared IP).
                     if not self.app.limiter.allow("trusted:" + source_key,
@@ -1599,7 +1727,7 @@ class Handler(BaseHTTPRequestHandler):
                                                   self.app.anon_write_limit, self.app.anon_write_window):
                         rejected.append({"i": i, "reason": "rate limited"})
                         continue
-                self.app.store.ingest(obj, source_key, tier, mc_uid=mc_uid)
+                self.app.store.ingest(obj, source_key, tier, mc_uid=mc_uid, credit_id=credit_id)
                 tiers_used.add(tier)
                 accepted += 1
             except ValueError as e:
@@ -1923,6 +2051,55 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": str(e)})
         self._json(200, {"tokenId": token_id, "token": token, "server": server,
                           "note": "store this now -- it is never shown again"})
+
+    def _link_credit_opt_in(self):
+        # Same trust boundary as /link/bot-complete: the bot already knows the
+        # caller's real discord_id with certainty (Discord's own gateway/interaction
+        # signature), so it authenticates itself with ARD_BOT_SECRET and supplies the
+        # discord_id directly -- no separate OAuth round-trip needed for a flag flip.
+        if self.app.auth.links is None:
+            return self._json(503, {"error": "account linking not configured"})
+        if not self.app.auth.is_bot(self._token()):
+            return self._json(401, {"error": "bot credential required"})
+        try:
+            raw = self._read_body()
+            body = json.loads(raw) if raw else {}
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "bad json"})
+        discord_id, server, opt_in = body.get("discordId"), body.get("server"), body.get("optIn")
+        if not discord_id or not server or not isinstance(opt_in, bool):
+            return self._json(400, {"error": "discordId, server, and a boolean optIn are required"})
+        ok = self.app.auth.links.set_credit_opt_in(discord_id, server, opt_in)
+        if not ok:
+            return self._json(404, {"error": "no linked identity for that discordId on that server -- "
+                                              "/link there first"})
+        self._json(200, {"discordId": discord_id, "server": server, "creditOptIn": opt_in})
+
+    def _credits_leaderboard(self, server):
+        # Bot or moderator/admin/owner only -- mirrors _dispatch_list's gating.
+        # Reveals discord_ids, so this stays behind a credential even though the
+        # bot itself only ever surfaces it inside the Discord server it already
+        # governs (never re-exposed as a public read like /conditions is).
+        scopes = self._caller_scopes(server)
+        is_mod = self.app.auth.is_owner(self._token()) or \
+            trust.SCOPE_MODERATOR in scopes or trust.SCOPE_ADMIN in scopes
+        is_bot = self.app.auth.is_bot(self._token())
+        if not (is_mod or is_bot):
+            return self._json(403, {"error": "the bot credential or moderator/admin scope "
+                                              "is required for this server"})
+        if server not in self.app.store.networks:
+            return self._json(404, {"error": "unknown server"})
+        qs = parse_qs(urlparse(self.path).query)
+        kind = qs.get("kind", ["survey"])[0]
+        if kind not in ("survey", "crew"):
+            return self._json(400, {"error": "kind must be 'survey' or 'crew'"})
+        try:
+            since = float(qs["since"][0]) if "since" in qs else None
+        except ValueError:
+            return self._json(400, {"error": "bad since"})
+        rows = self.app.store.award_leaderboard(server, since=since) if kind == "survey" \
+            else self.app.store.repair_leaderboard(server, since=since)
+        self._json(200, {"server": server, "kind": kind, "leaderboard": rows})
 
     def _identity_action(self, server, discord_id, action):
         if not self._require_moderator_for(server):

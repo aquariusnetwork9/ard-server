@@ -597,6 +597,47 @@ moderator token or dashboard session already can. `GET /dispatch/<server>` also 
 bot credential with no `discordId` at all, since listing (to render the queue for humans) isn't
 an action taken on anyone's behalf.
 
+**Survey / Road Crew credit (0.1.9):** two siloed-per-server leaderboards backing Highway Bot's
+cosmetic contribution ladders — **Survey** (confirmed hazard reports) and **Road Crew** (completed
+dispatch claims). Road Crew needed no new storage or privacy decision at all: a dispatch claim is
+never anonymous to begin with (only a linked Tier B+ identity, or the bot vouching for one, can
+claim), and `complete_dispatch` already never clears `claimed_by`, so a lifetime per-person repair
+count is a plain read over the existing `dispatch` table.
+
+Survey credit is the opposite case — a real, deliberate trade-off, opt-in only. Every other
+identity concept in this protocol (the reputation-layer `identity_hash`, `_source_hash`) is a
+one-way salted hash specifically so a past reporter can never be resolved back to a real person;
+crediting someone by name requires breaking that for Tier B specifically. A Discord identity that
+has completed `/link` on a server can flip `credit_opt_in` for that (discord_id, server) pair via
+`POST /link/credit-opt-in` (same bot-vouched trust boundary as `/link/bot-complete` — the bot
+already knows the caller's real discord_id with certainty). Default is off. Once opted in, every
+Tier B report from that identity that both counts toward corroboration and lands on a
+now-published condition writes a permanent row to `credits` (`server, cond_id, discord_id, kind,
+awarded_at`), deduplicated per (condition, identity) so repeated resends of an already-confirmed
+report never double-award. Deliberately every contributor gets credited this way, not only whoever's
+report happened to tip a condition over the threshold — real reporters resend periodically anyway
+(see the fleet-side reporter modules' own resend-throttle), so each contributor is credited the
+next time they report while the condition is still confirmed. Tier C is never eligible at all —
+there is no real-world identity behind an IP hash to credit. Retention is intentionally permanent:
+once awarded, a credit row is never purged, even if the identity later opts back out (opting out
+only stops *future* writes) — a conscious choice in service of a real, persistent leaderboard/reward
+system, not an oversight, and it must be disclosed plainly wherever `/credit` is offered.
+
+`GET /credits/<server>/leaderboard?kind=survey|crew&since=<epoch>` reads either leaderboard,
+optionally scoped to a period (`since`) for the weekly/monthly races — gated to the bot credential
+or a moderator/admin scope for that server, same posture as `/dispatch/<server>`'s own visibility
+gate, since this surface reveals discord_ids rather than being a public read like `/conditions`.
+
+**Radar (situational awareness, 0.1.9):** Highway Bot's per-server `#<server>-radar` channel
+renders raw report activity — including a lone, not-yet-published Tier C report — well below what
+the promoted dispatch queue ever surfaces. The public `/conditions/<server>` route can't back this:
+it deliberately never returns unpublished rows (see §6.4/§7 — a public reader watching exactly how
+close a spot sits to the corroboration threshold would be a live readout of the gate itself). A new
+`GET /conditions/<server>/all` mirrors `/conditions/<server>`'s own query params (`road`/`from`/`to`)
+but includes unpublished rows too, gated the same way as `/dispatch/<server>` and
+`/credits/<server>/leaderboard` — the bot credential or a moderator/admin scope for that server.
+This is a privileged audience, not a relaxation of the public route's own gate.
+
 ## 7. Consumption
 
 | route | method | auth | purpose |
@@ -609,7 +650,9 @@ an action taken on anyone's behalf.
 | `/link/complete` | POST | none (holds a Discord `discordCode` instead) | resolves a link code + Discord OAuth code into a Tier B token scoped to the `/link/init` record's server — §6.2 |
 | `/link/bot-complete` | POST | `ARD_BOT_SECRET` (first-party bot credential) | resolves a link code + an already-Discord-verified `discordId` into a Tier B token; response includes `server` — §6.2.1 |
 | `/link/config` | GET | none (public, rate-limited) | Discord `clientId`/`redirectUri`/`authorizeUrl` for the website's link page to build the OAuth URL — never the client secret |
+| `/link/credit-opt-in` | POST | `ARD_BOT_SECRET` (first-party bot credential) | body `{discordId, server, optIn}` — flips Survey-credit opt-in for an already-linked identity — §6.7 |
 | `/conditions/<server>` | GET | **none (public, rate-limited)** | published, non-expired conditions (`?road=&from=&to=`) |
+| `/conditions/<server>/all` | GET | the bot credential, or `moderator`/`admin` scope **for that server** | same as above but includes unpublished rows too — Highway Bot's radar feed — §6.7 |
 | `/conditions/<server>/stream` | GET | **none (public, rate-limited)** | live SSE of updates — published-state only (0.1.6), see §6.4 |
 | `/moderation` | POST | **none (public, own rate limit — separate from the read limit)** | submit an anomaly for approval (`schema/moderation.schema.json`) |
 | `/moderation/<server>` | GET | `moderator` (or `admin`) scope **for that server**, token or dashboard session | list pending anomalies — §6.3 |
@@ -621,6 +664,7 @@ an action taken on anyone's behalf.
 | `/dispatch/<server>/queue` | POST | `moderator`/`admin` scope **for that server**, token or session | body `{road, seg, along}` — manually queue a spot — §6.7 |
 | `/dispatch/<id>/claim` | POST | `full`/`maintainer` (fleet) token, or the bot credential + body `{discordId}`, **for the entry's own server** | claim a queued entry — §6.7 |
 | `/dispatch/<id>/complete` | POST | the claimant's own token/actor, `moderator`/`admin` scope, or the bot credential + `{discordId}` for the entry's own server | resolve a claimed entry — §6.7 |
+| `/credits/<server>/leaderboard` | GET | the bot credential, or `moderator`/`admin` scope **for that server** | `?kind=survey\|crew&since=<epoch>` — Survey/Road Crew leaderboard, optionally period-scoped — §6.7 |
 | `/registry` | POST/GET/DELETE | Owner (all servers) or a dashboard `admin` session (own server(s) only) | issue/list/revoke registry tokens of any scope; issuing requires `server` in the body — §6.3/§6.6 |
 | `/admin/login` | POST | none (holds a Discord `discordCode` instead) | exchanges a Discord code for a session cookie, if that identity holds any `discord_grants` — §6.6 |
 | `/admin/logout` | POST | dashboard session | revokes the presented session — §6.6 |

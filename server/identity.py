@@ -87,6 +87,7 @@ class LinkStore:
         CREATE TABLE IF NOT EXISTS identities(
           discord_id TEXT NOT NULL, server TEXT NOT NULL, created_at REAL NOT NULL,
           suspended INTEGER NOT NULL DEFAULT 0, suspended_at REAL,
+          credit_opt_in INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY(discord_id, server)
         );
         CREATE TABLE IF NOT EXISTS linked_uids(
@@ -123,12 +124,17 @@ class LinkStore:
             CREATE TABLE identities(
               discord_id TEXT NOT NULL, server TEXT NOT NULL, created_at REAL NOT NULL,
               suspended INTEGER NOT NULL DEFAULT 0, suspended_at REAL,
+              credit_opt_in INTEGER NOT NULL DEFAULT 0,
               PRIMARY KEY(discord_id, server)
             );
             INSERT INTO identities(discord_id, server, created_at, suspended, suspended_at)
               SELECT discord_id, '2b2t.org', created_at, suspended, suspended_at FROM identities_old;
             DROP TABLE identities_old;
             """)
+            self.db.commit()
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(identities)").fetchall()}
+        if "credit_opt_in" not in cols:
+            self.db.execute("ALTER TABLE identities ADD COLUMN credit_opt_in INTEGER NOT NULL DEFAULT 0")
             self.db.commit()
 
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(linked_uids)").fetchall()}
@@ -335,6 +341,27 @@ class LinkStore:
                 " WHERE lu.token_hash=? AND lu.server=? AND lu.revoked=0 AND i.suspended=0",
                 (self.hash_token(token), server)).fetchone()
         return row[0] if row else None
+
+    # ---- credit opt-in (Survey leaderboard, SS6.7) ----
+    def set_credit_opt_in(self, discord_id, server, value):
+        """Flips whether confirmed Tier B reports from this identity get a
+        permanent, real discord_id credit record (see Store.credits in
+        highway_conditions.py). Off by default -- only ever true after an
+        explicit /credit on. Requires the identity to already exist (i.e. this
+        discord_id has completed at least one /link on this server); returns
+        False if it hasn't rather than silently creating a bare row."""
+        with self._lock:
+            cur = self.db.execute(
+                "UPDATE identities SET credit_opt_in=? WHERE discord_id=? AND server=?",
+                (1 if value else 0, discord_id, server))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def credit_opt_in_for(self, discord_id, server):
+        row = self.db.execute(
+            "SELECT credit_opt_in FROM identities WHERE discord_id=? AND server=?",
+            (discord_id, server)).fetchone()
+        return bool(row and row[0])
 
     # ---- moderator actions (SS6.5) ----
     def suspend(self, discord_id, server):
