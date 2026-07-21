@@ -53,25 +53,58 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(v2["distinctSources"], 2)
         self.assertTrue(v2["published"])
 
-    def test_tier_m_publishes_clear_unilaterally_but_not_new_hazard(self):
-        # Tier M is what App._report assigns for a maintainer-scope token on a CLEAR
-        # report specifically -- the Store itself just needs to auto-publish tier "M"
-        # the same way it does "A". (The cond==CLEAR gating lives in App._report, not
-        # here -- Store.ingest trusts whatever tier it's handed.)
-        v = self.store.ingest(self.report(2100, 0, cond="CLEAR"), "10.0.0.1", "M")
+    def test_tier_m_publishes_any_cond_unilaterally(self):
+        # M is the top tier -- both a new hazard and a CLEAR from it auto-publish.
+        v = self.store.ingest(self.report(2100, 0, cond="HOLE"), "tok:m1", "M")
+        self.assertTrue(v["published"])
+        self.assertEqual(v["tier"], "M")
+        v = self.store.ingest(self.report(2150, 0, cond="CLEAR"), "tok:m1", "M")
         self.assertTrue(v["published"])
         self.assertEqual(v["tier"], "M")
 
-    def test_tier_rank_a_beats_m_beats_c_on_merge(self):
+    def test_tier_m_raise_then_own_clear_publishes(self):
+        # The inspector cycle: find a clog, report it, physically clear it, report the
+        # clear -- the SAME holder's clear publishes immediately, unlike every tier
+        # below M where the raiser's own clear doesn't even count toward corroboration.
+        hole = self.report(2170, 0, cond="HOLE")
+        self.store.ingest(hole, "tok:inspector", "M")
+        self.clock.t += 5
+        v = self.store.ingest(self.report(2170, 0, cond="CLEAR"), "tok:inspector", "M")
+        self.assertTrue(v["published"])
+        rows = self.store.query(SERVER)
+        self.assertFalse(any(r["cond"] == "HOLE" and r["along"] == hole["along"] for r in rows),
+                         "the inspector's own clear resolves the hazard they raised")
+
+    def test_tier_a_clear_needs_corroboration(self):
+        # A raises unilaterally, but its CLEAR doesn't -- and its own raise never
+        # counts toward its own clear.
+        hole = self.report(2180, 0, cond="HOLE")
+        self.store.ingest(hole, "tok:bot1", "A")
+        self.clock.t += 5
+        clear = self.report(2180, 0, cond="CLEAR")
+        v = self.store.ingest(clear, "tok:bot1", "A")  # the raiser's own clear
+        self.assertFalse(v["published"])
+        self.assertEqual(v["distinctSources"], 0, "raiser's own clear doesn't corroborate")
+        # Other, distinct A holders corroborate it (threshold = k_tier_b * clear_factor = 4 here).
+        self.store.ingest(clear, "tok:bot2", "A")
+        self.store.ingest(clear, "tok:bot3", "A")
+        self.store.ingest(clear, "tok:bot4", "A")
+        v = self.store.ingest(clear, "tok:bot5", "A")
+        self.assertTrue(v["published"])
+        rows = self.store.query(SERVER)
+        self.assertFalse(any(r["cond"] == "HOLE" and r["along"] == hole["along"] for r in rows),
+                         "the corroborated clear resolves the hazard")
+
+    def test_tier_rank_m_beats_a_beats_c_on_merge(self):
         r = self.report(2200, 0)
         v1 = self.store.ingest(r, "10.0.0.1", "C")
         self.assertEqual(v1["tier"], "C")
-        v2 = self.store.ingest(r, "10.0.0.2", "M")
-        self.assertEqual(v2["tier"], "M", "M outranks C on merge")
-        v3 = self.store.ingest(r, "10.0.0.3", "A")
-        self.assertEqual(v3["tier"], "A", "A outranks M on merge")
+        v2 = self.store.ingest(r, "tok:a1", "A")
+        self.assertEqual(v2["tier"], "A", "A outranks C on merge")
+        v3 = self.store.ingest(r, "tok:m1", "M")
+        self.assertEqual(v3["tier"], "M", "M outranks A on merge")
         v4 = self.store.ingest(r, "10.0.0.4", "C")
-        self.assertEqual(v4["tier"], "A", "a later low-tier report never downgrades the merged tier")
+        self.assertEqual(v4["tier"], "M", "a later low-tier report never downgrades the merged tier")
 
     # --- CLEAR <-> hazard reconciliation (PROTOCOL.md SS6.4) --------------------------
     def test_clear_suppresses_published_hazard_then_reopen_reveals_it_again(self):
@@ -81,7 +114,7 @@ class IngestTests(unittest.TestCase):
                              for v in self.store.query(SERVER)), "hazard published before any clear")
 
         self.clock.t += 5
-        self.store.ingest(self.report(7000, 0, cond="CLEAR"), "10.0.0.2", "A")  # Tier A clears unilaterally
+        self.store.ingest(self.report(7000, 0, cond="CLEAR"), "tok:m2", "M")  # Tier M clears unilaterally
         rows = self.store.query(SERVER)
         self.assertFalse(any(v["cond"] == "HOLE" and v["along"] == hole["along"] for v in rows),
                           "a newer published CLEAR suppresses the hazard it resolves")
@@ -99,7 +132,7 @@ class IngestTests(unittest.TestCase):
         hole = self.report(7100, 0, cond="HOLE")
         self.store.ingest(hole, "10.0.0.1", "A")
         self.clock.t += 5
-        self.store.ingest(self.report(7100, 0, cond="CLEAR"), "10.0.0.2", "A")
+        self.store.ingest(self.report(7100, 0, cond="CLEAR"), "tok:m2", "M")
         self.assertEqual(self.store.list_moderation("pending"), [])
 
         self.clock.t += 5  # well within reopen_window (3600s default, ttl=1000s in this test)
@@ -120,7 +153,7 @@ class IngestTests(unittest.TestCase):
                                                    cond=cond, now=self.clock.t)
         store.ingest(r("HOLE"), "10.0.0.1", "A")
         self.clock.t += 5
-        store.ingest(r("CLEAR"), "10.0.0.2", "A")
+        store.ingest(r("CLEAR"), "tok:m2", "M")
         self.clock.t += 100  # past reopen_window (50s) but well within ttl (1000s) -- clear still active
         store.ingest(r("HOLE"), "10.0.0.3", "A")
         self.assertEqual(store.list_moderation("pending"), [], "reopen outside the window isn't flagged")

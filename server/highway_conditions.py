@@ -154,21 +154,29 @@ def validate_moderation(obj):
 # --------------------------------------------------------------------------- store
 
 # Write-tier precedence for merging corroborating reports of the same condition key.
-# Tier A (fully vouched) and Tier M (maintainer, clear-only — see App._report) both
-# auto-publish; Tier B (Discord-verified) and Tier C (anonymous) need corroboration,
-# B at a lower threshold than C (see PROTOCOL.md §6.1).
-_TIER_RANK = {"C": 0, "B": 1, "M": 2, "A": 3}
-_AUTO_PUBLISH_TIERS = {"A", "M"}
-_CORROBORATED_TIERS = {"B", "C"}
+# M (maintainer/inspector) is the top tier: publishes anything unilaterally, including
+# CLEARs of its own raises. Tier A (vouched reporter) publishes new hazards unilaterally
+# but its CLEARs go through corroboration like B/C (at B's threshold) — and its own
+# raise never counts toward its own clear (the non-overlap rule applies to it the same
+# as everyone below). Tier B (Discord-verified) and Tier C (anonymous) need
+# corroboration for everything, B at a lower threshold than C (PROTOCOL.md §6.1).
+_TIER_RANK = {"C": 0, "B": 1, "A": 2, "M": 3}
+_CORROBORATED_TIERS = {"B", "C"}  # tiers subject to the reputation layer below
+
+
+def _auto_publishes(tier, cond):
+    """Does a report at this tier publish without corroboration for this cond?"""
+    if tier == "M":
+        return True
+    return tier == "A" and cond != "CLEAR"
 
 # --- Reputation layer (PROTOCOL.md §6.1.1) ------------------------------------------
 # Per-identity trust score + travel-plausibility check, layered onto the corroboration
 # counting above. Uses a second hash space from _source_hash below -- scoped per-identity
 # (server, source_key) rather than per-condition-key -- recomputed live per request, never
 # persisted raw, same handling as every other use of source_key in this file. Applies only
-# to Tier B/C (_CORROBORATED_TIERS): Tier A/M bypass corroboration/weighting entirely and
-# use the caller's IP as source_key, which isn't a stable per-identity signal for this
-# project's own bot fleet (several bots legitimately share one VPS IP).
+# to Tier B/C (_CORROBORATED_TIERS): A/M are registry-vetted holders whose grants are
+# revocable directly, so they're managed through the registry rather than scored here.
 TRUST_BASELINE = 1.0    # starting trust for a first-seen identity
 TRUST_MIN = 0.2         # floor
 TRUST_MAX = 1.0         # ceiling
@@ -319,9 +327,12 @@ class Store:
         return False
 
     def _corroboration_threshold(self, tier):
-        """Base k for a corroborated tier -- Tier B (Discord-verified) is lower than
-        Tier C (bare IP) (K_TIER_B_NEW vs K_TIER_C_NEW, PROTOCOL.md §2)."""
-        return self.k_tier_b if tier == "B" else self.k_anon
+        """Base k for a tier that needs corroboration -- Tier B (Discord-verified) is
+        lower than Tier C (bare IP) (K_TIER_B_NEW vs K_TIER_C_NEW, PROTOCOL.md §2).
+        Tier A appears here only for its CLEAR reports (which don't auto-publish --
+        see _auto_publishes) and corroborates at B's threshold, since an A holder is
+        at least as vetted as a linked identity."""
+        return self.k_anon if tier == "C" else self.k_tier_b
 
     def _corroboration_weight(self, cond_id, now):
         """Sum of sources.weight for non-expired sources -- what the publish/confidence
@@ -397,7 +408,7 @@ class Store:
         if row is None:
             return None
         cond_id, tier, last_seen = row
-        if tier in _AUTO_PUBLISH_TIERS:
+        if _auto_publishes(tier, "CLEAR"):
             return last_seen
         weight = self._corroboration_weight(cond_id, now)
         return last_seen if weight >= self._corroboration_threshold(tier) * self.clear_factor else None
@@ -407,8 +418,10 @@ class Store:
         """report must already have passed validate_report(). tier is 'A', 'M', 'B',
         or 'C' (see App._report for how a presented token maps to a tier). source_key
         is whatever identifies the reporter for corroboration purposes -- the raw
-        client IP for Tier C, a resolved discord_id for Tier B, irrelevant (but still
-        passed through) for auto-publishing A/M.
+        client IP for Tier C, a resolved discord_id for Tier B, a per-holder token id
+        for A/M (matters for A: its CLEARs go through corroboration and the
+        non-overlap rule, so its source identity has to be stable per holder, not a
+        shared fleet IP).
 
         Returns a view dict."""
         server = report["server"]
@@ -444,8 +457,7 @@ class Store:
         src = self._source_hash(server, canon, seg, along, cond, source_key)
         # Reputation layer: only meaningful for tiers that actually go through
         # corroboration counting -- see the module-level note above _TIER_RANK for why
-        # A/M are excluded (shared-IP fleet bots would otherwise false-positive on
-        # travel-plausibility against each other).
+        # A/M are excluded (registry-vetted, managed through grant revocation instead).
         identity_hash = None
         weight = 1.0
         with self._lock:
@@ -516,10 +528,10 @@ class Store:
         # unless a source has been discounted -- see the note above _TIER_RANK).
         ds = self._distinct_sources(cond_id, now)
         weight = self._corroboration_weight(cond_id, now)
-        published = (tier in _AUTO_PUBLISH_TIERS) or (weight >= k_req)
+        published = _auto_publishes(tier, cond) or (weight >= k_req)
         age = now - last_seen
         recency = max(0.0, 1.0 - age / self.ttl)
-        strength = 1.0 if tier in _AUTO_PUBLISH_TIERS else min(1.0, weight / max(1, k_req))
+        strength = 1.0 if _auto_publishes(tier, cond) else min(1.0, weight / max(1, k_req))
         conf = round(strength * recency, 3)
         road_idx = net["_canon2idx"].get(canon)
         x = z = None
@@ -553,7 +565,7 @@ class Store:
             rows = self.db.execute(q, args).fetchall()
         out = []
         for r in rows:
-            canon = r[2]
+            canon, raw_last_seen = r[2], r[9]
             v = self._row_view(net, r, now)
             if frm is not None and v["along"] < frm:
                 continue
@@ -563,7 +575,10 @@ class Store:
                 continue
             if v["cond"] in _HAZARD_CONDS:
                 clear_ts = self._active_clear(server, canon, v["seg"], v["along"], now)
-                if clear_ts is not None and clear_ts > v["lastSeen"]:
+                # Compare against the row's raw timestamp, not the view's int-rounded
+                # lastSeen -- rounding made a hazard reported sub-second after a clear
+                # look older than the clear and get wrongly suppressed.
+                if clear_ts is not None and clear_ts > raw_last_seen:
                     continue  # resolved: a newer published CLEAR supersedes this hazard
             out.append(v)
         out.sort(key=lambda v: (v["road"] if v["road"] is not None else -1, v["seg"], v["along"]))
@@ -779,6 +794,12 @@ class Auth:
         server, or unrecognized. Doesn't cover Tier B -- see tier_b_identity, a
         separate lookup since Tier B isn't a "scope" on this registry at all."""
         return self.registry.scope_of(token, server)
+
+    def write_credentials(self, token, server):
+        """(token_id, scope) for a live registry token on this server, or None --
+        one lookup where _report needs both the scope and a stable per-holder
+        source identity."""
+        return self.registry.credentials_of(token, server)
 
     def tier_b_identity(self, token, server):
         """The discord_id behind a live, linked Tier B token ON THIS SERVER, or None."""
@@ -1155,14 +1176,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _report(self):
-        # scope: 'full' -> Tier A (unilateral, any cond). 'maintainer' -> Tier M ONLY
-        # for cond==CLEAR (unilateral); everything else from that token falls through
-        # to Tier B (if it resolves to a linked Discord identity) or Tier C (anon) --
-        # see PROTOCOL.md SS6.1, a maintainer grant deliberately doesn't include
-        # new-hazard publish rights. Trust is server-scoped (SS6.3/SS6.2), and a
-        # single batch can legitimately mix servers (one token might hold Tier A on
-        # 2b2t.org but nothing on 6b6t.org), so scope/tier has to be resolved PER
-        # ITEM from that item's own `server` field -- never once for the whole batch.
+        # scope: 'maintainer' -> Tier M (top tier -- publishes any cond unilaterally,
+        # including CLEARs of its own raises; the inspector finds-it/fixes-it/clears-it
+        # cycle is one trusted unit). 'full' -> Tier A (new hazards publish
+        # unilaterally; CLEARs go through corroboration like everyone below, and the
+        # holder's own raise never counts toward its own clear). Both use their
+        # registry token_id as the corroboration source identity, so distinct holders
+        # stay distinct sources behind one shared fleet IP. Trust is server-scoped
+        # (SS6.3/SS6.2), and a single batch can legitimately mix servers (one token
+        # might hold Tier A on 2b2t.org but nothing on 6b6t.org), so scope/tier has to
+        # be resolved PER ITEM from that item's own `server` field -- never once for
+        # the whole batch.
         token = self._token()
         try:
             raw = self._read_body()
@@ -1177,11 +1201,12 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 validate_report(obj)
                 server = obj["server"]
-                scope = self.app.auth.write_scope(token, server)
-                if scope == trust.SCOPE_FULL:
-                    tier, source_key = "A", self._client_ip()
-                elif scope == trust.SCOPE_MAINTAINER and obj["cond"] == "CLEAR":
-                    tier, source_key = "M", self._client_ip()
+                creds = self.app.auth.write_credentials(token, server)
+                scope = creds[1] if creds else None
+                if scope == trust.SCOPE_MAINTAINER:
+                    tier, source_key = "M", "tok:" + creds[0]
+                elif scope == trust.SCOPE_FULL:
+                    tier, source_key = "A", "tok:" + creds[0]
                 else:
                     discord_id = self.app.auth.tier_b_identity(token, server)
                     if discord_id is not None:
@@ -1192,7 +1217,7 @@ class Handler(BaseHTTPRequestHandler):
                         tier, source_key = "B", discord_id
                     else:
                         tier, source_key = "C", self._client_ip()
-                if tier != "A":
+                if tier not in ("A", "M"):
                     if not self.app.limiter.allow("write:" + self._client_ip(),
                                                   self.app.anon_write_limit, self.app.anon_write_window):
                         rejected.append({"i": i, "reason": "rate limited"})

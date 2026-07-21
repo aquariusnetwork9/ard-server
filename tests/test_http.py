@@ -217,21 +217,40 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(len(body["rejected"]), 1)
         self.assertIn("unknown field", body["rejected"][0]["reason"])
 
-    # --- writes: Tier M (maintainer scope) ---------------------------------------
+    # --- writes: Tier M (maintainer scope, top tier) ------------------------------
     def test_maintainer_clears_unilaterally(self):
         r = self.a_report(cond="CLEAR", x=6002)
         code, body = req("POST", self.url("/report"), token=MAINTAINER_TOKEN, body=r)
         self.assertEqual(code, 200)
         self.assertEqual(body["tiers"], ["M"], "a CLEAR from a maintainer token auto-publishes")
 
-    def test_maintainer_new_hazard_is_not_unilateral(self):
-        # A maintainer grant deliberately does NOT include new-hazard publish rights
-        # (PROTOCOL.md SS6.1) -- a HOLE report from this token falls through to the
-        # same anonymous/Tier-C corroboration path as no token at all.
-        r = self.a_report(cond="HOLE", x=6003)
+    def test_maintainer_new_hazard_publishes_unilaterally(self):
+        # M is the top tier (PROTOCOL.md SS6.1) -- a new hazard from a maintainer
+        # token publishes immediately, same as its clears.
+        r = self.a_report(cond="HOLE", x=6350)
         code, body = req("POST", self.url("/report"), token=MAINTAINER_TOKEN, body=r)
         self.assertEqual(code, 200)
-        self.assertEqual(body["tiers"], ["C"])
+        self.assertEqual(body["tiers"], ["M"])
+        code, body = req("GET", self.url(f"/conditions/{SERVER}"))
+        self.assertTrue(any(c["cond"] == "HOLE" and c["tier"] == "M" for c in body["conditions"]))
+
+    def test_full_scope_clear_is_not_unilateral(self):
+        # An A (full-scope) holder's new hazard publishes immediately, but its CLEAR
+        # of that hazard needs corroboration from OTHER sources -- the raiser's own
+        # clear doesn't publish and doesn't even count toward the threshold.
+        hole = self.a_report(cond="HOLE", x=6250)
+        code, body = req("POST", self.url("/report"), token=FULL_TOKEN, body=hole)
+        self.assertEqual(body["tiers"], ["A"])
+        clear = self.a_report(cond="CLEAR", x=6250)
+        code, body = req("POST", self.url("/report"), token=FULL_TOKEN, body=clear)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["tiers"], ["A"])
+        code, body = req("GET", self.url(f"/conditions/{SERVER}"))
+        conds = [c for c in body["conditions"] if c["along"] == hole["along"]]
+        self.assertTrue(any(c["cond"] == "HOLE" for c in conds),
+                        "the hazard stays published -- the raiser's own clear resolves nothing")
+        self.assertFalse(any(c["cond"] == "CLEAR" for c in conds),
+                         "an uncorroborated A clear is not published")
 
     # --- moderation: submission is public, but the queue itself needs moderator scope
     def test_moderation_submit_is_public_but_independently_rate_limited(self):

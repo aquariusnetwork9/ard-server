@@ -36,7 +36,7 @@ it before constructing any report object**. It is never transmitted, bucketed, o
 | `K_TIER_C_NEW` | `4` | distinct Tier C (IP-hash) sources required to publish a *new* condition |
 | `K_TIER_B_NEW` | `2` | distinct Tier B (Discord identity) sources required to publish a *new* condition |
 | `K_CLEAR_FACTOR` | `2×` | CLEAR/downgrade reports require this multiple of the tier's normal `k` — see §6.4 |
-| `MAINTAINER_REOPEN_WINDOW` | `3600` (1h) | a Tier A/M clear reopened within this window routes to `/moderation` — see §6.4 |
+| `MAINTAINER_REOPEN_WINDOW` | `3600` (1h) | a published clear reopened within this window routes to `/moderation` — see §6.4 |
 | `MAX_TRAVEL_SPEED` | `100` blocks/sec | above this implied speed between an identity's two claimed positions, the newer report doesn't corroborate anything — see §6.1.1 |
 | `TRUST_BASELINE` / `TRUST_MIN` / `TRUST_MAX` | `1.0` / `0.2` / `1.0` | per-identity trust weight range — see §6.1.1 |
 | `TRUST_PENALTY` / `TRUST_BOOST` | `0.15` / `0.05` | per travel-implausible report / per report that helps a condition publish — see §6.1.1 |
@@ -171,22 +171,26 @@ operator's bootstrap credential, not a per-community grant.
 
 ### 6.1 The tiers
 
-- **Tier A (vouched):** holds a live token from the admin-issued registry (§6.3). Publishes at
-  high confidence without waiting for corroboration. This is how the project's own fleet bots
-  work today, and how any other person or group an admin chooses to trust works going forward —
-  same mechanism, not a separate "fleet" concept.
-- **Tier M (maintainer):** a *scoped* grant from the same admin-issued registry as Tier A
-  (§6.3), for highway-maintenance groups who do the physical work of clearing obstructions.
-  Can publish CLEAR/downgrade reports unilaterally on **any** obstruction-class condition —
-  not just ones the holder raised — bypassing §6.4's corroboration and non-overlap rule the
-  same way Tier A does. Deliberately narrower than Tier A otherwise: a Tier M holder's *new*
-  condition reports are **not** auto-published — they're treated at Tier B strength (still
-  need corroboration) unless the holder separately also carries a full (`scope: full`) Tier A
-  grant. Rationale for the split: "I fixed this and it's now clear" is a claim the whole
-  community fact-checks within minutes just by traveling the road, so it's safe to extend
-  broadly to vetted groups; "there's a new hazard here" is much harder to fact-check quickly
-  (an off-route claim can go unnoticed), so unilateral new-hazard publish rights stay gated at
-  the normal tier the holder would otherwise sit at.
+Tier order, lowest to highest trust: **C < B < A < M** (2026-07-21 reordering — M is now the
+top tier; it was previously a clear-only grant below A).
+
+- **Tier M (maintainer/inspector — highest):** a grant from the admin-issued registry (§6.3)
+  for highway-maintenance groups who do the physical work. Publishes **anything** unilaterally:
+  new hazards, CLEARs of other people's hazards, and — the defining use case — CLEARs of its
+  **own** raises. An inspector's find-it → fix-it → clear-it cycle is one trusted unit: the
+  raise publishes immediately and the same holder's clear resolves it immediately, with no
+  corroboration and no non-overlap restriction. This is the only tier that can do that.
+- **Tier A (vouched reporter):** holds a live token from the same registry (§6.3). *New hazard*
+  reports publish immediately without corroboration — this is how the project's own fleet bots
+  work, and how any person or group an admin vouches for works. But a Tier A **CLEAR does not
+  publish unilaterally**: it goes through corroboration like the tiers below (at Tier B's
+  threshold × `K_CLEAR_FACTOR`), and the non-overlap rule applies — the A holder who raised a
+  hazard contributes nothing toward clearing it; other sources (any tier) have to confirm the
+  fix. Rationale for the asymmetry: a fleet bot detecting a hazard on its route is strong,
+  cheap evidence; one bot passing through claiming "it's fine now" is much weaker evidence than
+  a vetted human crew saying "we fixed it," so fix claims stay with M or with corroboration.
+  Each A/M holder's corroboration source identity is its registry `token_id` (per-holder, not
+  the shared fleet IP), so distinct bots behind one VPS stay distinct sources.
 - **Tier B (verified):** authenticated via a Discord identity with at least one linked,
   ownership-verified Minecraft UID (§6.2). Tentative until `K_TIER_B_NEW` **distinct
   identities** corroborate. Distinct-source counting is **by Discord identity, not by UID** —
@@ -227,10 +231,10 @@ blocks/sec — well above any real travel mode, including elytra e-bounce) means
 excluded from corroboration for this condition key (same mechanism as the existing non-overlap
 rule below) and applies a small trust penalty. A report with no prior claim on record (a fresh
 identity, or nothing recent enough to matter) is never flagged — there's nothing to compare
-against. Deliberately scoped to Tier B/C only: Tier A/M auto-publish and don't consult weight at
-all, and Tier A's `source_key` is the caller's IP — this project's own fleet runs several
-distinct bots behind one VPS IP, and travel-plausibility-checking Tier A would immediately
-false-positive against that.
+against. Deliberately scoped to Tier B/C only: A/M holders are registry-vetted with individually
+revocable grants (§6.3), so misbehavior there is handled by pulling the grant, not by a score —
+and their `source_key` is their registry `token_id` (per-holder), used for corroboration
+counting on A clears, not for reputation.
 
 **Trust weighting.** Each identity has a trust score in `[TRUST_MIN, TRUST_MAX]` = `[0.2, 1.0]`,
 starting at `1.0` (baseline) — a fresh, first-time contributor's report counts exactly as much
@@ -344,8 +348,8 @@ different servers):
 
 | `scope` | grants |
 |---|---|
-| `full` (Tier A) | publish + clear anything unilaterally |
-| `maintainer` (Tier M) | clear/downgrade anything unilaterally; new reports fall through to normal Tier B/C corroboration |
+| `full` (Tier A) | publish new hazards unilaterally; CLEARs go through corroboration (§6.1/§6.4) |
+| `maintainer` (Tier M) | top tier — publish + clear anything unilaterally, including own raises |
 | `moderator` | adjudicate the `/moderation` queue and suspend/reinstate Tier B/C identities (§6.5) — **not** report-publishing power |
 
 Only an **Owner** can issue or revoke registry entries of any scope, including `moderator` —
@@ -357,23 +361,27 @@ owners are an Owner-only action too, not built into v1.
 ### 6.4 Corroboration & asymmetric thresholds
 
 A **new** condition needs `K_TIER_B_NEW` distinct Tier B identities or `K_TIER_C_NEW` distinct
-Tier C sources (or a single Tier A report) to publish. A report that **downgrades or clears an
+Tier C sources (or a single Tier A/M report) to publish. A report that **downgrades or clears an
 already-published condition** is held to a stricter bar — clearing and raising a new hazard are
 deliberately asymmetric, not mirror-image operations:
 
-- Requires `K_CLEAR_FACTOR ×` the normal threshold for that tier.
+- Requires `K_CLEAR_FACTOR ×` the normal threshold for that tier. A Tier A CLEAR corroborates
+  at Tier B's base threshold (an A holder is at least as vetted as a linked identity), so an
+  A-raised clear needs `K_CLEAR_FACTOR × K_TIER_B_NEW` total weight from non-overlapping
+  sources.
 - The corroborating sources for a CLEAR must **not overlap** with the sources that created or
   corroborated the condition being cleared — a source can't both raise and resolve the same
-  hazard.
-- Tier A and Tier M can both clear unilaterally (see §6.1) — Tier A because it's fully vouched,
-  Tier M because a fix claim is fast and cheap for the community to fact-check by just
-  traveling the road.
-- **Reopen accountability:** if a condition cleared by Tier A or Tier M is re-reported as still
-  present within `MAINTAINER_REOPEN_WINDOW` of the clear, it's routed to `/moderation` for
-  review rather than silently republished as a fresh hazard. A fast reopen is the practical
-  signal that a clear was wrong — whether by honest mistake, something re-breaking almost
-  immediately, or bad faith — and it's cheap to check since it doesn't block the reopen report
-  itself from going out, just also creates a review record.
+  hazard. This applies to Tier A too: the A holder that raised a hazard contributes nothing
+  toward clearing it.
+- **Only Tier M clears unilaterally** (see §6.1) — the physical-repair tier, whose fix claims
+  are fast and cheap for the community to fact-check by just traveling the road. Tier A's
+  clears go through the corroboration path above.
+- **Reopen accountability:** if a published clear is re-reported as still present within
+  `MAINTAINER_REOPEN_WINDOW` of the clear, it's routed to `/moderation` for review rather than
+  silently republished as a fresh hazard. A fast reopen is the practical signal that a clear
+  was wrong — whether by honest mistake, something re-breaking almost immediately, or bad
+  faith — and it's cheap to check since it doesn't block the reopen report itself from going
+  out, just also creates a review record.
 
 ### 6.5 Moderator scope
 
@@ -452,7 +460,7 @@ cryptographic surface area worth its own careful pass rather than folding into t
 |-------|--------|------|---------|
 | `/health` | GET | none | liveness only, no data |
 | `/geometry/<server>` | GET | **none (public, rate-limited)** | authoritative road table + `map` + `BUCKET` |
-| `/report` | POST | Tier A / Tier M (clear only) / Tier B / anon (Tier C) | ingest reports — see §6 |
+| `/report` | POST | Tier M / Tier A / Tier B / anon (Tier C) | ingest reports — see §6 |
 | `/link/init` | POST | none (rate-limited) | body `{mcUid, server}` — server mints a pending link code — §6.2 |
 | `/link/complete` | POST | none (holds a Discord `discordCode` instead) | resolves a link code + Discord OAuth code into a Tier B token scoped to the `/link/init` record's server — §6.2 |
 | `/link/bot-complete` | POST | `ARD_BOT_SECRET` (first-party bot credential) | resolves a link code + an already-Discord-verified `discordId` into a Tier B token; response includes `server` — §6.2.1 |

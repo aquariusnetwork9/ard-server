@@ -149,13 +149,21 @@ class Registry:
     def scope_of(self, token, server):
         """Live scope for a presented raw token ON THIS SPECIFIC server, or None
         if absent/revoked/unknown/scoped to a different server."""
+        c = self.credentials_of(token, server)
+        return c[1] if c else None
+
+    def credentials_of(self, token, server):
+        """(token_id, scope) for a live token on this server, or None. token_id is
+        the public per-holder handle (never the secret) — used as a stable
+        corroboration source identity for registry-scoped writes, so distinct
+        holders stay distinct sources even behind one shared fleet IP."""
         if not token or not server:
             return None
         with self._lock:
             row = self.db.execute(
-                "SELECT scope FROM tokens WHERE token_hash=? AND server=? AND revoked=0",
+                "SELECT token_id, scope FROM tokens WHERE token_hash=? AND server=? AND revoked=0",
                 (self.hash_token(token), server)).fetchone()
-        return row[0] if row else None
+        return (row[0], row[1]) if row else None
 
     def has_scope(self, token, scope, server):
         return self.scope_of(token, server) == scope
