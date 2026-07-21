@@ -11,6 +11,7 @@ import reference_client  # noqa: E402
 
 GEO_DIR = ROOT / "geometry"
 SERVER = "2b2t.org"
+SERVER2 = "6b6t.org"
 
 
 class Clock:
@@ -662,6 +663,66 @@ class IdentitySaltPersistenceTests(unittest.TestCase):
                                        msg="a changed identity_salt orphans the old row -> baseline")
             finally:
                 store2.db.close()
+
+
+
+class BroadcastPublishOnlyTests(unittest.TestCase):
+    """A6: SSE only ever streams published-state views -- an unpublished
+    (tentative) report must never reach a subscriber, or it hands live
+    corroboration-progress feedback to anyone watching the stream."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.store = Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt")
+        self.net = self.store.networks[SERVER]
+        self.map = self.store.map_hashes[SERVER]
+
+    def report(self, x, z, cond="HOLE"):
+        r = reference_client.build_report(x, 120, z, "NETHER", self.net, self.map, SERVER,
+                                          cond=cond, now=self.clock.t)
+        self.assertIsNotNone(r)
+        return r
+
+    def drain(self, q):
+        out = []
+        while not q.empty():
+            out.append(q.get_nowait())
+        return out
+
+    def test_unpublished_report_is_not_broadcast(self):
+        q = self.store.subscribe(SERVER)
+        v = self.store.ingest(self.report(4000, 0), "10.0.0.1", "C")  # k_anon=2, tentative
+        self.assertFalse(v["published"])
+        self.assertEqual(self.drain(q), [], "a below-threshold report must not reach subscribers")
+
+    def test_publish_transition_is_broadcast(self):
+        q = self.store.subscribe(SERVER)
+        r = self.report(4100, 0)
+        self.store.ingest(r, "10.0.0.1", "C")  # tentative, no broadcast
+        self.assertEqual(self.drain(q), [])
+        v2 = self.store.ingest(r, "10.0.0.2", "C")  # crosses k_anon=2 -> published
+        self.assertTrue(v2["published"])
+        events = self.drain(q)
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["published"])
+
+    def test_auto_publish_tier_broadcasts_immediately(self):
+        q = self.store.subscribe(SERVER)
+        self.store.ingest(self.report(4200, 0), "tok:m1", "M")
+        events = self.drain(q)
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["published"])
+
+    def test_other_servers_subscribers_unaffected(self):
+        q = self.store.subscribe(SERVER2)
+        self.store.ingest(self.report(4300, 0), "tok:m1", "M")
+        self.assertEqual(self.drain(q), [], "a subscriber to a different server gets nothing")
+
+    def test_unsubscribe_stops_delivery(self):
+        q = self.store.subscribe(SERVER)
+        self.store.unsubscribe(q)
+        self.store.ingest(self.report(4400, 0), "tok:m1", "M")
+        self.assertEqual(self.drain(q), [])
 
 
 

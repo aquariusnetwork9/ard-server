@@ -455,6 +455,18 @@ deliberately asymmetric, not mirror-image operations:
   faith — and it's cheap to check since it doesn't block the reopen report itself from going
   out, just also creates a review record.
 
+**SSE only ever streams published-state views (0.1.6, a real fix, not a design choice from the
+start).** `Store.ingest`'s broadcast used to fire for every ingested report regardless of
+`published` — an unpublished (tentative, below-threshold) view still carries `distinctSources`/
+`confidence`/`cond`/`road`/`seg`/`along`, none of which `/conditions` itself ever exposes for an
+unpublished row (`query()` filters those out by default). Streaming them live handed anyone
+watching `/conditions/<server>/stream` a real-time readout of exactly how close any given spot is
+to crossing the corroboration threshold, and exactly when a specific report landed — neither
+knowable any other way. Fixed by gating the broadcast on `view["published"]`: a below-threshold
+report generates zero stream traffic; a condition's first crossing into `published`, or any later
+update while already published (more corroboration, a tier upgrade, a clear), still broadcasts
+normally, so the map's "something changed, refetch" nudge (§7) is unaffected.
+
 ### 6.5 Moderator scope
 
 A `scope: moderator` token is issued for one `server` (§6.3) and can, **on that server only**:
@@ -539,7 +551,7 @@ cryptographic surface area worth its own careful pass rather than folding into t
 | `/link/bot-complete` | POST | `ARD_BOT_SECRET` (first-party bot credential) | resolves a link code + an already-Discord-verified `discordId` into a Tier B token; response includes `server` — §6.2.1 |
 | `/link/config` | GET | none (public, rate-limited) | Discord `clientId`/`redirectUri`/`authorizeUrl` for the website's link page to build the OAuth URL — never the client secret |
 | `/conditions/<server>` | GET | **none (public, rate-limited)** | published, non-expired conditions (`?road=&from=&to=`) |
-| `/conditions/<server>/stream` | GET | **none (public, rate-limited)** | live SSE of updates |
+| `/conditions/<server>/stream` | GET | **none (public, rate-limited)** | live SSE of updates — published-state only (0.1.6), see §6.4 |
 | `/moderation` | POST | **none (public, own rate limit — separate from the read limit)** | submit an anomaly for approval (`schema/moderation.schema.json`) |
 | `/moderation/<server>` | GET | `moderator` (or `admin`) scope **for that server**, token or dashboard session | list pending anomalies — §6.3 |
 | `/moderation/<id>/<approve\|reject>` | POST | `moderator`/`admin` scope for the entry's own server, token or session | resolve an anomaly — §6.5 |

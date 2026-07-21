@@ -565,7 +565,15 @@ class Store:
             self.add_moderation(report, kind="reopen")
             self._emit("reopen", {"server": server, "road": report["road"],
                                    "seg": seg, "along": along, "cond": cond})
-        self._broadcast(server, view)
+        if view["published"]:
+            # Only ever stream published-state views. An unpublished (tentative,
+            # below-threshold) view still carries distinctSources/confidence/
+            # cond/road/seg/along -- broadcasting it regardless of publish state
+            # would hand any SSE subscriber a live readout of exactly how close a
+            # given spot is to crossing the corroboration threshold, and exactly
+            # when a specific report landed, neither of which /conditions itself
+            # ever exposes (query() only ever returns published rows by default).
+            self._broadcast(server, view)
         return view
 
     def _view_by_id(self, net, cond_id, now):
@@ -883,20 +891,44 @@ class Auth:
 
 
 class RateLimiter:
+    """Sliding-window limiter, one hit-timestamp bucket per key. Periodically
+    sweeps buckets that have gone fully idle so this dict doesn't grow forever --
+    once A1 made per-IP keys real (behind the tunnel) and A3 made per-token keys
+    real, every distinct IP/token ever seen gets its own entry; without eviction,
+    a key that stops being called (a one-time visitor who never returns) would
+    sit here as dead weight for the life of the process, unlike a key that's
+    checked again after going idle, which self-cleans on that next call anyway."""
+
+    EVICTION_INTERVAL = 300   # how often a sweep runs, in seconds
+    STALE_AFTER = 3600        # a bucket idle this long is swept, regardless of
+                              # whatever `window` the caller used for it -- safely
+                              # above every window this project actually configures
+
     def __init__(self):
         self._hits = {}
         self._lock = threading.Lock()
+        self._last_sweep = None
 
     def allow(self, key, limit, window, now=None):
         now = now if now is not None else time.time()
         with self._lock:
             bucket = [t for t in self._hits.get(key, []) if t > now - window]
-            if len(bucket) >= limit:
-                self._hits[key] = bucket
-                return False
-            bucket.append(now)
+            allowed = len(bucket) < limit
+            if allowed:
+                bucket.append(now)
             self._hits[key] = bucket
-            return True
+            self._maybe_evict(now)
+            return allowed
+
+    def _maybe_evict(self, now):
+        # Called with self._lock already held.
+        if self._last_sweep is not None and now - self._last_sweep < self.EVICTION_INTERVAL:
+            return
+        self._last_sweep = now
+        stale = [k for k, hits in self._hits.items()
+                 if not hits or max(hits) <= now - self.STALE_AFTER]
+        for k in stale:
+            del self._hits[k]
 
 
 class App:
