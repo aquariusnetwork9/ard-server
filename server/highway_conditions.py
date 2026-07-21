@@ -173,6 +173,13 @@ def _auto_publishes(tier, cond):
         return True
     return tier == "A" and cond != "CLEAR"
 
+# --- Dispatch queue (PROTOCOL.md SS6.5 -- a fleet bot's own Tier A/M observation
+# settles a queued spot through the existing corroboration math; this is pure
+# orchestration, no new verdict logic). Base weight per trigger before the
+# proximity-to-spawn factor in Store._dispatch_priority.
+_DISPATCH_TRIGGER_WEIGHT = {"conflict": 3.0, "reopen": 2.0, "manual": 1.5, "low_trust": 1.0}
+_DISPATCH_OPEN_STATUSES = ("queued", "claimed")
+
 # --- Reputation layer (PROTOCOL.md §6.1.1) ------------------------------------------
 # Per-identity trust score + travel-plausibility check, layered onto the corroboration
 # counting above. Uses a second hash space from _source_hash below -- scoped per-identity
@@ -195,7 +202,8 @@ class Store:
     def __init__(self, geometry_dir, db_path=":memory:", bucket=DEFAULT_BUCKET,
                  k_anon=4, k_tier_b=2, ttl=3600, clear_factor=2, reopen_window=3600,
                  salt=None, clock=time.time, max_travel_speed=MAX_TRAVEL_SPEED_DEFAULT,
-                 on_event=None, presence_oracles=None, identity_salt=None):
+                 on_event=None, presence_oracles=None, identity_salt=None,
+                 dispatch_ttl=86400, dispatch_claim_timeout=7200):
         self.bucket = bucket
         self.k_anon = k_anon      # Tier C (anonymous, IP-hash) corroboration threshold
         self.k_tier_b = k_tier_b  # Tier B (Discord-verified identity) threshold -- lower than
@@ -228,6 +236,12 @@ class Store:
         # though the rows are still sitting right there in a persistent --db file.
         # See build_app's --identity-salt/ARD_IDENTITY_SALT.
         self.identity_salt = identity_salt or secrets.token_hex(16)
+        # Dispatch queue tuning (SS6.5): how long an unclaimed target stays queued
+        # before it's stale enough to drop, and how long a claim survives without
+        # a resolution before it's assumed abandoned (bot went offline mid-trip)
+        # and reverts to queued for someone else to pick up.
+        self.dispatch_ttl = dispatch_ttl
+        self.dispatch_claim_timeout = dispatch_claim_timeout
         self.networks = {}
         self.map_hashes = {}
         self._lock = threading.RLock()
@@ -294,6 +308,15 @@ class Store:
           last_road INTEGER, last_seg INTEGER, last_along INTEGER,
           last_x REAL, last_z REAL, last_seen REAL
         );
+        CREATE TABLE IF NOT EXISTS dispatch(
+          id INTEGER PRIMARY KEY,
+          server TEXT, road_canon TEXT, seg INTEGER, along INTEGER,
+          trigger TEXT NOT NULL, priority REAL NOT NULL,
+          status TEXT NOT NULL DEFAULT 'queued',
+          claimed_by TEXT, created REAL NOT NULL, claimed_at REAL, resolved_at REAL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS dispatch_open_key
+          ON dispatch(server, road_canon, seg, along) WHERE status IN ('queued','claimed');
         """)
         # sources.weight didn't exist before the reputation layer -- ALTER, not
         # CREATE, since a live deployment's DB already has this table without it.
@@ -375,6 +398,16 @@ class Store:
             return
         try:
             self.on_event(kind, details)
+        except Exception:
+            pass
+
+    def _safe_enqueue_dispatch(self, server, road_idx, seg, along, trigger):
+        """road_idx/seg/along are already validated by this exact ingest() call --
+        enqueue_dispatch's own validation is redundant in practice. Swallow
+        anything anyway, same posture as _emit: a dispatch-queue hiccup must
+        never fail the ingest that triggered it."""
+        try:
+            self.enqueue_dispatch(server, road_idx, seg, along, trigger)
         except Exception:
             pass
 
@@ -500,12 +533,23 @@ class Store:
             clear_ts = self._active_clear(server, canon, seg, along, now)
             if clear_ts is not None and (now - clear_ts) <= self.reopen_window:
                 reopened = True
+        # Dispatch (SS6.5): a CLEAR resolving a hazard that only just appeared is
+        # the same shape as `reopened` in the other direction -- fast-clear-over-
+        # a-fresh-trap instead of fast-reopen-after-a-clear. Checked before the
+        # ingest below updates `conditions`, so "fresh" reflects state prior to
+        # this report.
+        fresh_hazard_before = cond == "CLEAR" and self._fresh_hazard_exists(server, canon, seg, along, now)
         # Non-overlap (SS6.4): a source that raised a hazard here can't also count
         # toward clearing it. See _reported_a_hazard_here for why this can't be
         # enforced by comparing stored hashes -- it has to be checked live, per
-        # request, against this specific source_key.
-        counts_toward_corroboration = not (
-            cond == "CLEAR" and self._reported_a_hazard_here(server, canon, seg, along, source_key, now))
+        # request, against this specific source_key. Also reused below: a fast
+        # CLEAR is only a `conflict` dispatch signal when it comes from a
+        # DIFFERENT source than the one that raised the hazard -- an inspector's
+        # own find-it/fix-it/clear-it cycle is the trusted case Tier M/A already
+        # exists for, not a fake-clear-over-a-trap.
+        raised_this_hazard_itself = cond == "CLEAR" and self._reported_a_hazard_here(
+            server, canon, seg, along, source_key, now)
+        counts_toward_corroboration = not raised_this_hazard_itself
         src = self._source_hash(server, canon, seg, along, cond, source_key)
         # Reputation layer: only meaningful for tiers that actually go through
         # corroboration counting -- see the module-level note above _TIER_RANK for why
@@ -565,6 +609,15 @@ class Store:
             self.add_moderation(report, kind="reopen")
             self._emit("reopen", {"server": server, "road": report["road"],
                                    "seg": seg, "along": along, "cond": cond})
+            self._safe_enqueue_dispatch(server, report["road"], seg, along, "reopen")
+        if fresh_hazard_before and not raised_this_hazard_itself and view["published"]:
+            self._safe_enqueue_dispatch(server, report["road"], seg, along, "conflict")
+            self._emit("dispatch_conflict", {"server": server, "road": report["road"],
+                                              "seg": seg, "along": along})
+        if view["published"] and view["tier"] == "C":
+            self._safe_enqueue_dispatch(server, report["road"], seg, along, "low_trust")
+        if tier in ("A", "M"):
+            self._maybe_resolve_dispatch(server, canon, seg, along, now)
         if view["published"]:
             # Only ever stream published-state views. An unpublished (tentative,
             # below-threshold) view still carries distinctSources/confidence/
@@ -724,6 +777,159 @@ class Store:
                  None, "approved", now))
             self.db.commit()
         return True
+
+    # ---- dispatch queue (PROTOCOL.md SS6.5) ----
+    def _dispatch_priority(self, net, road_idx, seg, along, trigger):
+        """Base weight per trigger type (how urgent the SHAPE of the problem is)
+        scaled by proximity to spawn (a rough, already-available proxy for actual
+        consumption -- 2b2t highway traffic concentrates near spawn along the
+        axes/diagonals; there is no real query-count metric to rank against)."""
+        base = _DISPATCH_TRIGGER_WEIGHT.get(trigger, 1.0)
+        if seg >= len(net["roads"][road_idx]["segments"]):
+            return base
+        x, z = rederive(net, road_idx, seg, along, self.bucket)
+        if x is None:
+            return base
+        dist = max(abs(x), abs(z))
+        proximity = 1.0 / (1.0 + dist / geometry.NEAR_SPAWN_RADIUS)
+        return round(base * proximity, 4)
+
+    def enqueue_dispatch(self, server, road_idx, seg, along, trigger, now=None):
+        """Idempotent: at most one OPEN (queued/claimed) entry per spatial key,
+        enforced by dispatch_open_key. A repeated trigger for a spot that's
+        already queued just escalates its priority instead of piling up
+        duplicates. Returns the (possibly pre-existing) dispatch id."""
+        net = self.networks.get(server)
+        if net is None:
+            raise KeyError(server)
+        if not (0 <= road_idx < len(net["roads"])):
+            raise ValueError("road out of range")
+        canon = net["_canon"][road_idx]
+        now = now if now is not None else self.clock()
+        priority = self._dispatch_priority(net, road_idx, seg, along, trigger)
+        with self._lock:
+            row = self.db.execute(
+                "SELECT id, priority FROM dispatch WHERE server=? AND road_canon=? AND seg=?"
+                " AND along=? AND status IN ('queued','claimed')",
+                (server, canon, seg, along)).fetchone()
+            if row is not None:
+                did, prev_priority = row
+                if priority > prev_priority:
+                    self.db.execute("UPDATE dispatch SET priority=?, trigger=? WHERE id=?",
+                                    (priority, trigger, did))
+                    self.db.commit()
+                return did
+            cur = self.db.execute(
+                "INSERT INTO dispatch(server,road_canon,seg,along,trigger,priority,status,created)"
+                " VALUES(?,?,?,?,?,?,'queued',?)",
+                (server, canon, seg, along, trigger, priority, now))
+            self.db.commit()
+            return cur.lastrowid
+
+    def _sweep_dispatch(self, server, now):
+        """Called with self._lock already held. Reverts an abandoned claim (bot
+        never came back) to queued for someone else, and expires queued entries
+        nobody ever claimed -- both lazily, on the next read, same idiom as the
+        rest of this file's TTL handling (no background thread)."""
+        self.db.execute(
+            "UPDATE dispatch SET status='queued', claimed_by=NULL, claimed_at=NULL"
+            " WHERE server=? AND status='claimed' AND claimed_at<?",
+            (server, now - self.dispatch_claim_timeout))
+        self.db.execute(
+            "UPDATE dispatch SET status='expired' WHERE server=? AND status='queued' AND created<?",
+            (server, now - self.dispatch_ttl))
+        self.db.commit()
+
+    def list_dispatch(self, server, now=None):
+        net = self.networks.get(server)
+        if net is None:
+            raise KeyError(server)
+        now = now if now is not None else self.clock()
+        with self._lock:
+            self._sweep_dispatch(server, now)
+            rows = self.db.execute(
+                "SELECT id,road_canon,seg,along,trigger,priority,status,claimed_by,created,claimed_at"
+                " FROM dispatch WHERE server=? AND status IN ('queued','claimed')"
+                " ORDER BY priority DESC, created ASC",
+                (server,)).fetchall()
+        canon2idx = net["_canon2idx"]
+        return [{
+            "id": r[0], "road": canon2idx.get(r[1]), "seg": r[2], "along": r[3],
+            "trigger": r[4], "priority": r[5], "status": r[6], "claimedBy": r[7],
+            "created": int(r[8]), "claimedAt": None if r[9] is None else int(r[9]),
+        } for r in rows]
+
+    def dispatch_server(self, did):
+        """The `server` a dispatch id belongs to, or None -- same purpose as
+        moderation_server: resolve the server BEFORE authorizing a scoped action
+        against it."""
+        with self._lock:
+            row = self.db.execute("SELECT server FROM dispatch WHERE id=?", (did,)).fetchone()
+        return row[0] if row else None
+
+    def claim_dispatch(self, did, token_id, now=None):
+        """None: no such id. False: existed but wasn't claimable (already
+        claimed/done/expired -- a race with another bot, or gone stale). True:
+        claimed by token_id."""
+        now = now if now is not None else self.clock()
+        with self._lock:
+            row = self.db.execute("SELECT server FROM dispatch WHERE id=?", (did,)).fetchone()
+            if row is None:
+                return None
+            self._sweep_dispatch(row[0], now)
+            cur = self.db.execute(
+                "UPDATE dispatch SET status='claimed', claimed_by=?, claimed_at=?"
+                " WHERE id=? AND status='queued'",
+                (token_id, now, did))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def complete_dispatch(self, did, token_id, now=None, force=False):
+        """None: no such id. False: not currently claimed by token_id (or not
+        claimed at all, or already resolved) and force wasn't set. True: marked
+        done. force=True (moderator override) completes any currently-claimed
+        entry regardless of which token holds the claim."""
+        now = now if now is not None else self.clock()
+        with self._lock:
+            row = self.db.execute("SELECT claimed_by, status FROM dispatch WHERE id=?", (did,)).fetchone()
+            if row is None:
+                return None
+            claimed_by, status = row
+            if status != "claimed" or (not force and claimed_by != token_id):
+                return False
+            cur = self.db.execute(
+                "UPDATE dispatch SET status='done', resolved_at=? WHERE id=? AND status='claimed'",
+                (now, did))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    def _maybe_resolve_dispatch(self, server, canon, seg, along, now):
+        """A fresh Tier A/M report landing on a claimed target IS the verification
+        trip completing -- its own auto-publish/CLEAR already settles the
+        underlying condition through the ordinary corroboration math (SS6.5's
+        whole point: no new verdict logic), this just closes the queue entry."""
+        with self._lock:
+            row = self.db.execute(
+                "SELECT id FROM dispatch WHERE server=? AND road_canon=? AND seg=? AND along=?"
+                " AND status='claimed'", (server, canon, seg, along)).fetchone()
+            if row is not None:
+                self.db.execute("UPDATE dispatch SET status='done', resolved_at=? WHERE id=?",
+                                (now, row[0]))
+                self.db.commit()
+
+    def _fresh_hazard_exists(self, server, canon, seg, along, now):
+        """Whether an active hazard-type row at this key was FIRST reported within
+        reopen_window -- a CLEAR landing here right now would be resolving a hazard
+        that only just appeared, the same fast-clear-over-a-fresh-trap shape as
+        `reopen` but the other direction (clearing suspiciously soon vs. reopening
+        suspiciously soon)."""
+        placeholders = ",".join("?" * len(_HAZARD_CONDS))
+        row = self.db.execute(
+            f"SELECT 1 FROM conditions WHERE server=? AND road_canon=? AND seg=? AND along=?"
+            f" AND cond IN ({placeholders}) AND last_seen>=? AND first_seen>=?",
+            (server, canon, seg, along, *sorted(_HAZARD_CONDS),
+             now - self.ttl, now - self.reopen_window)).fetchone()
+        return row is not None
 
     def retract_identity(self, server, source_key, now=None):
         """Removes every currently-active `sources` row this source_key would
@@ -993,6 +1199,9 @@ _CONDITIONS_RE = re.compile(r"^/conditions/([^/]+)(/stream)?$")
 _GEOMETRY_RE = re.compile(r"^/geometry/([^/]+)$")
 _MOD_LIST_RE = re.compile(r"^/moderation/([^/]+)$")
 _MOD_RESOLVE_RE = re.compile(r"^/moderation/(\d+)/(approve|reject)$")
+_DISPATCH_LIST_RE = re.compile(r"^/dispatch/([^/]+)$")
+_DISPATCH_QUEUE_RE = re.compile(r"^/dispatch/([^/]+)/queue$")
+_DISPATCH_ACTION_RE = re.compile(r"^/dispatch/(\d+)/(claim|complete)$")
 _REGISTRY_ID_RE = re.compile(r"^/registry/([0-9a-f]{16})$")
 _IDENTITY_ACTION_RE = re.compile(r"^/identity/([^/]+)/([^/]+)/(suspend|reinstate)$")
 _ADMIN_GRANT_ID_RE = re.compile(r"^/admin/grants/([0-9a-f]{16})$")
@@ -1094,6 +1303,9 @@ class Handler(BaseHTTPRequestHandler):
         m = _MOD_LIST_RE.match(path)
         if m:
             return self._moderation_list(m.group(1))
+        m = _DISPATCH_LIST_RE.match(path)
+        if m:
+            return self._dispatch_list(m.group(1))
         if path == "/registry":
             return self._registry_list()
         if path == "/link/config":
@@ -1115,6 +1327,13 @@ class Handler(BaseHTTPRequestHandler):
         m = _MOD_RESOLVE_RE.match(path)
         if m:
             return self._moderation_resolve(int(m.group(1)), m.group(2))
+        m = _DISPATCH_QUEUE_RE.match(path)
+        if m:
+            return self._dispatch_queue_manual(m.group(1))
+        m = _DISPATCH_ACTION_RE.match(path)
+        if m:
+            return self._dispatch_claim(int(m.group(1))) if m.group(2) == "claim" \
+                else self._dispatch_complete(int(m.group(1)))
         if path == "/registry":
             return self._registry_issue()
         if path == "/link/init":
@@ -1191,6 +1410,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"error": "moderator scope required for this server"})
             return False
         return True
+
+    def _require_fleet_for(self, server):
+        """A live registry token scoped 'full' (Tier A) or 'maintainer' (Tier M)
+        on this server -- the same credential /report already authenticates
+        A/M writes with. Returns (token_id, scope), or None after already
+        responding 403."""
+        creds = self.app.auth.write_credentials(self._token(), server)
+        if creds is None or creds[1] not in (trust.SCOPE_FULL, trust.SCOPE_MAINTAINER):
+            self._json(403, {"error": "a registry-scoped (A/M) token is required for this server"})
+            return None
+        return creds
 
     def _require_admin_for(self, server):
         if self.app.auth.is_owner(self._token()):
@@ -1415,6 +1645,76 @@ class Handler(BaseHTTPRequestHandler):
         except (KeyError, ValueError) as e:
             return self._json(400, {"error": str(e)})
         self._json(200 if ok else 404, {"quashed": ok})
+
+    # ---- dispatch queue (PROTOCOL.md SS6.5) ----
+    def _dispatch_list(self, server):
+        # Fleet (A/M token, same credential /report uses) polls to work the
+        # queue; moderator/admin can also view it for visibility, but only a
+        # fleet-scoped token can claim (see _dispatch_claim).
+        creds = self.app.auth.write_credentials(self._token(), server)
+        is_fleet = creds is not None and creds[1] in (trust.SCOPE_FULL, trust.SCOPE_MAINTAINER)
+        scopes = self._caller_scopes(server)
+        is_mod = self.app.auth.is_owner(self._token()) or \
+            trust.SCOPE_MODERATOR in scopes or trust.SCOPE_ADMIN in scopes
+        if not (is_fleet or is_mod):
+            return self._json(403, {"error": "a registry-scoped (A/M) token or moderator "
+                                              "scope is required for this server"})
+        try:
+            queue = self.app.store.list_dispatch(server)
+        except KeyError:
+            return self._json(404, {"error": "unknown server"})
+        self._json(200, {"queue": queue})
+
+    def _dispatch_queue_manual(self, server):
+        if not self._require_moderator_for(server):
+            return
+        try:
+            raw = self._read_body()
+            body = json.loads(raw) if raw else {}
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "bad json"})
+        road, seg, along = body.get("road"), body.get("seg"), body.get("along")
+        if not (_is_int(road) and _is_int(seg) and _is_int(along)):
+            return self._json(400, {"error": "road/seg/along must be integers"})
+        try:
+            did = self.app.store.enqueue_dispatch(server, road, seg, along, "manual")
+        except (KeyError, ValueError) as e:
+            return self._json(400, {"error": str(e)})
+        self._json(200, {"id": did})
+
+    def _dispatch_claim(self, did):
+        server = self.app.store.dispatch_server(did)
+        if server is None:
+            return self._json(404, {"error": "not found"})
+        creds = self._require_fleet_for(server)
+        if creds is None:
+            return
+        result = self.app.store.claim_dispatch(did, creds[0])
+        if result is None:
+            return self._json(404, {"error": "not found"})
+        if not result:
+            return self._json(409, {"error": "already claimed or not queued"})
+        self._json(200, {"claimed": True})
+
+    def _dispatch_complete(self, did):
+        server = self.app.store.dispatch_server(did)
+        if server is None:
+            return self._json(404, {"error": "not found"})
+        # Either the claimant's own token, or a moderator/owner overriding it
+        # (a stuck or abandoned claim someone needs to force-close).
+        scopes = self._caller_scopes(server)
+        force = self.app.auth.is_owner(self._token()) or \
+            trust.SCOPE_MODERATOR in scopes or trust.SCOPE_ADMIN in scopes
+        creds = self.app.auth.write_credentials(self._token(), server)
+        token_id = creds[0] if creds and creds[1] in (trust.SCOPE_FULL, trust.SCOPE_MAINTAINER) else None
+        if not force and token_id is None:
+            return self._json(403, {"error": "a claimant token or moderator scope is required"})
+        result = self.app.store.complete_dispatch(did, token_id, force=force)
+        if result is None:
+            return self._json(404, {"error": "not found"})
+        if not result:
+            return self._json(409, {"error": "not currently claimed (by you)"})
+        self._json(200, {"completed": True})
 
     # ---- registry: Owner (all servers) or a per-server dashboard admin ----
     def _registry_issue(self):
@@ -1831,6 +2131,13 @@ def _wire_events(store, notifier):
                 "ARD: identity hit the trust floor",
                 f"identity {d['identityHash']} was repeatedly discounted down to the "
                 f"trust floor — worth a moderator look.")
+        elif kind == "dispatch_conflict":
+            notifier.send(
+                f"dispatch-conflict:{d['server']}:{d['road']}:{d['seg']}:{d['along']}",
+                "ARD: fast CLEAR over a fresh hazard",
+                f"{d['server']} road {d['road']} seg {d['seg']} along {d['along']}: a CLEAR "
+                f"just published over a hazard that only just appeared — queued for "
+                f"fleet verification.", priority="high")
     store.on_event = on_event
 
 
@@ -1861,7 +2168,8 @@ def build_app(args):
                   k_anon=args.k_anon, k_tier_b=args.k_tier_b, ttl=args.ttl,
                   clear_factor=args.clear_factor, reopen_window=args.reopen_window,
                   max_travel_speed=args.max_travel_speed, presence_oracles=presence_oracles,
-                  identity_salt=_resolve_identity_salt(args))
+                  identity_salt=_resolve_identity_salt(args),
+                  dispatch_ttl=args.dispatch_ttl, dispatch_claim_timeout=args.dispatch_claim_timeout)
     notifier = notify.Notifier(url=getattr(args, "ntfy_url", None),
                                 token=getattr(args, "ntfy_token", None))
     if notifier.enabled:
@@ -1924,6 +2232,12 @@ def main(argv=None):
                      help="a hazard reopening within this many seconds of a published clear "
                           "is flagged to /moderation instead of silently republished "
                           "(PROTOCOL.md MAINTAINER_REOPEN_WINDOW, SS6.4)")
+    ap.add_argument("--dispatch-ttl", type=int, default=86400,
+                     help="a queued (never-claimed) dispatch entry expires after this many "
+                          "seconds (PROTOCOL.md SS6.5)")
+    ap.add_argument("--dispatch-claim-timeout", type=int, default=7200,
+                     help="a claimed dispatch entry with no resolution reverts to queued "
+                          "after this many seconds (bot went offline mid-trip)")
     ap.add_argument("--max-travel-speed", type=float, default=MAX_TRAVEL_SPEED_DEFAULT,
                      help="blocks/sec -- a Tier B/C identity claiming two positions further "
                           "apart than this implies within the elapsed time between them is "

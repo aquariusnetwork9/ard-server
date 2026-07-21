@@ -725,6 +725,165 @@ class BroadcastPublishOnlyTests(unittest.TestCase):
         self.assertEqual(self.drain(q), [])
 
 
+class DispatchQueueTests(unittest.TestCase):
+    """SS6.5: the dispatch queue itself (enqueue/claim/complete/sweep/priority)
+    plus ingest()'s auto-triggers (reopen/conflict/low_trust) and auto-resolve
+    on a fleet Tier A/M re-report."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.store = Store(str(GEO_DIR), k_anon=2, ttl=10000, reopen_window=600,
+                           clock=self.clock, salt="testsalt",
+                           dispatch_ttl=100000, dispatch_claim_timeout=500)
+        self.net = self.store.networks[SERVER]
+        self.map = self.store.map_hashes[SERVER]
+
+    def report(self, x, z, cond="HOLE"):
+        r = reference_client.build_report(x, 120, z, "NETHER", self.net, self.map, SERVER,
+                                          cond=cond, now=self.clock.t)
+        self.assertIsNotNone(r)
+        return r
+
+    def queue(self):
+        return self.store.list_dispatch(SERVER)
+
+    # ---- raw queue mechanics ----
+    def test_enqueue_then_list(self):
+        r = self.report(9000, 0)
+        did = self.store.enqueue_dispatch(SERVER, r["road"], r["seg"], r["along"], "manual")
+        q = self.queue()
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["id"], did)
+        self.assertEqual(q[0]["status"], "queued")
+        self.assertEqual(q[0]["trigger"], "manual")
+
+    def test_repeated_enqueue_is_idempotent_and_escalates_priority(self):
+        r = self.report(9010, 0)
+        did1 = self.store.enqueue_dispatch(SERVER, r["road"], r["seg"], r["along"], "low_trust")
+        did2 = self.store.enqueue_dispatch(SERVER, r["road"], r["seg"], r["along"], "conflict")
+        self.assertEqual(did1, did2, "same spatial key -> same entry, not a duplicate")
+        q = self.queue()
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["trigger"], "conflict", "trigger field reflects the escalation")
+
+    def test_lower_priority_reenqueue_does_not_downgrade(self):
+        r = self.report(9020, 0)
+        self.store.enqueue_dispatch(SERVER, r["road"], r["seg"], r["along"], "conflict")
+        before = self.queue()[0]["priority"]
+        self.store.enqueue_dispatch(SERVER, r["road"], r["seg"], r["along"], "low_trust")
+        after = self.queue()[0]["priority"]
+        self.assertEqual(before, after, "a lower-weight trigger must not lower an existing priority")
+
+    def test_closer_to_spawn_ranks_higher_for_the_same_trigger(self):
+        near = self.report(1000, 0)
+        far = self.report(9500, 0)
+        self.store.enqueue_dispatch(SERVER, far["road"], far["seg"], far["along"], "low_trust")
+        self.store.enqueue_dispatch(SERVER, near["road"], near["seg"], near["along"], "low_trust")
+        q = self.queue()
+        self.assertEqual(len(q), 2)
+        self.assertEqual(q[0]["along"], near["along"], "closer-to-spawn target sorts first")
+
+    def test_claim_then_second_claim_fails(self):
+        r = self.report(9030, 0)
+        did = self.store.enqueue_dispatch(SERVER, r["road"], r["seg"], r["along"], "manual")
+        self.assertTrue(self.store.claim_dispatch(did, "tok:bot1"))
+        self.assertFalse(self.store.claim_dispatch(did, "tok:bot2"), "already claimed")
+
+    def test_claim_nonexistent_id_returns_none(self):
+        self.assertIsNone(self.store.claim_dispatch(999999, "tok:bot1"))
+
+    def test_complete_by_a_different_token_without_force_fails(self):
+        r = self.report(9040, 0)
+        did = self.store.enqueue_dispatch(SERVER, r["road"], r["seg"], r["along"], "manual")
+        self.store.claim_dispatch(did, "tok:bot1")
+        self.assertFalse(self.store.complete_dispatch(did, "tok:bot2"))
+        self.assertTrue(self.store.complete_dispatch(did, "tok:bot1"))
+
+    def test_complete_with_force_ignores_claimant(self):
+        r = self.report(9050, 0)
+        did = self.store.enqueue_dispatch(SERVER, r["road"], r["seg"], r["along"], "manual")
+        self.store.claim_dispatch(did, "tok:bot1")
+        self.assertTrue(self.store.complete_dispatch(did, "tok:someone-else", force=True))
+
+    def test_claim_reverts_to_queued_after_claim_timeout(self):
+        r = self.report(9060, 0)
+        did = self.store.enqueue_dispatch(SERVER, r["road"], r["seg"], r["along"], "manual")
+        self.store.claim_dispatch(did, "tok:bot1")
+        self.clock.t += 501  # past dispatch_claim_timeout=500
+        q = self.queue()  # triggers the lazy sweep
+        self.assertEqual(q[0]["status"], "queued")
+        self.assertIsNone(q[0]["claimedBy"])
+        # and it's claimable again
+        self.assertTrue(self.store.claim_dispatch(did, "tok:bot2"))
+
+    def test_queued_entry_expires_after_dispatch_ttl(self):
+        r = self.report(9070, 0)
+        self.store.enqueue_dispatch(SERVER, r["road"], r["seg"], r["along"], "manual")
+        self.clock.t += 100001  # past dispatch_ttl=100000
+        self.assertEqual(self.queue(), [], "an unclaimed, expired entry drops out of the open queue")
+
+    # ---- ingest() auto-triggers ----
+    def test_reopen_triggers_a_dispatch_entry(self):
+        hole = self.report(9100, 0, cond="HOLE")
+        self.store.ingest(hole, "tok:m1", "M")
+        self.store.ingest(self.report(9100, 0, cond="CLEAR"), "tok:m1", "M")
+        self.clock.t += 10  # well within reopen_window=600
+        self.store.ingest(self.report(9100, 0, cond="HOLE"), "10.0.0.9", "A")
+        q = self.queue()
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["trigger"], "reopen")
+
+    def test_fast_clear_over_a_fresh_hazard_triggers_conflict(self):
+        hole = self.report(9110, 0, cond="HOLE")
+        self.store.ingest(hole, "10.0.0.1", "A")  # Tier A hazard auto-publishes
+        self.clock.t += 10  # well within reopen_window=600 -- still "fresh"
+        self.store.ingest(self.report(9110, 0, cond="CLEAR"), "tok:m1", "M")  # M clears unilaterally
+        q = self.queue()
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["trigger"], "conflict")
+
+    def test_clear_over_a_stale_hazard_is_not_a_conflict(self):
+        hole = self.report(9120, 0, cond="HOLE")
+        self.store.ingest(hole, "10.0.0.1", "A")
+        self.clock.t += 700  # past reopen_window=600 -- no longer "fresh"
+        self.store.ingest(self.report(9120, 0, cond="CLEAR"), "tok:m1", "M")
+        self.assertEqual(self.queue(), [])
+
+    def test_tier_c_only_publish_triggers_low_trust(self):
+        r = self.report(9130, 0)
+        self.store.ingest(r, "10.0.0.1", "C")  # tentative
+        v = self.store.ingest(r, "10.0.0.2", "C")  # k_anon=2 -> published, tier stays C
+        self.assertTrue(v["published"])
+        self.assertEqual(v["tier"], "C")
+        q = self.queue()
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["trigger"], "low_trust")
+
+    def test_a_report_never_triggers_low_trust(self):
+        self.store.ingest(self.report(9140, 0), "10.0.0.1", "A")  # publishes immediately, tier A
+        self.assertEqual(self.queue(), [])
+
+    def test_a_fresh_am_report_auto_resolves_a_claimed_entry(self):
+        r = self.report(9150, 0)
+        self.store.ingest(r, "10.0.0.1", "C")
+        self.store.ingest(r, "10.0.0.2", "C")  # published, tier C -> low_trust queued
+        did = self.queue()[0]["id"]
+        self.store.claim_dispatch(did, "tok:bot1")
+        # The dispatched bot's own Tier A/M observation at the exact same spot
+        # settles it through the ordinary corroboration math -- no new verdict
+        # logic, this just closes the queue entry.
+        self.store.ingest(self.report(9150, 0, cond="CLEAR"), "tok:bot1", "M")
+        self.assertEqual(self.queue(), [], "a completed (done) entry drops out of the open queue")
+
+    def test_a_report_does_not_resolve_a_still_queued_entry(self):
+        r = self.report(9160, 0)
+        self.store.ingest(r, "10.0.0.1", "C")
+        self.store.ingest(r, "10.0.0.2", "C")  # published, tier C -> low_trust queued, unclaimed
+        self.store.ingest(self.report(9160, 0, cond="CLEAR"), "tok:bot1", "M")
+        # Not claimed, so nothing to auto-resolve -- the entry is still open
+        # (still worth a look even though this particular CLEAR already landed).
+        self.assertEqual(len(self.queue()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

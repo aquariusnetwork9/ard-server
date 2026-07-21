@@ -38,6 +38,8 @@ it before constructing any report object**. It is never transmitted, bucketed, o
 | `MIN_DISCORD_ACCOUNT_AGE` | `0` (off) | minimum Discord account age to complete a Tier B link (`--min-discord-age-days`/`ARD_MIN_DISCORD_AGE_DAYS`); derived from the snowflake id itself, no extra API call — see §6.2 |
 | `K_CLEAR_FACTOR` | `2×` | CLEAR/downgrade reports require this multiple of the tier's normal `k` — see §6.4 |
 | `MAINTAINER_REOPEN_WINDOW` | `3600` (1h) | a published clear reopened within this window routes to `/moderation` — see §6.4 |
+| `DISPATCH_TTL` | `86400` (24h) | an unclaimed dispatch entry expires after this long — see §6.7 |
+| `DISPATCH_CLAIM_TIMEOUT` | `7200` (2h) | a claimed dispatch entry with no resolution reverts to queued after this long — see §6.7 |
 | `MAX_TRAVEL_SPEED` | `100` blocks/sec | above this implied speed between an identity's two claimed positions, the newer report doesn't corroborate anything — see §6.1.1 |
 | `TRUST_BASELINE` / `TRUST_MIN` / `TRUST_MAX` | `1.0` / `0.2` / `1.0` | per-identity trust weight range — see §6.1.1 |
 | `TRUST_PENALTY` / `TRUST_BOOST` | `0.15` / `0.05` | per travel-implausible report / per report that helps a condition publish — see §6.1.1 |
@@ -538,6 +540,48 @@ as a second factor alongside Discord OAuth on every login. Would need a from-scr
 COSE/CBOR + ECDSA (P-256) implementation to keep this project's no-pip posture — real
 cryptographic surface area worth its own careful pass rather than folding into this change.
 
+### 6.7 Dispatch queue (fleet auto-verification, 0.1.7)
+
+A small orchestration layer on top of §6 rather than a new trust mechanism: **a fleet bot's own
+Tier A/M observation, once it travels to a queued spot, already settles the underlying condition
+through the ordinary corroboration math in §6.4** (its CLEAR resolves a fake hazard, its
+re-report confirms a real one). Nothing new is verified or merged here — this only decides
+*where a bot should go next*.
+
+An entry is queued automatically, keyed to one spatial key (`server, road, seg, along`) at a
+time — a repeated trigger for an already-queued spot escalates its priority in place rather than
+creating a duplicate. Trigger shapes:
+
+- **`reopen`** — the existing §6.4 reopen-accountability signal also queues a dispatch entry
+  (not just a `/moderation` flag).
+- **`conflict`** — a CLEAR resolves a hazard that only just appeared (within
+  `MAINTAINER_REOPEN_WINDOW` of its first report), from a **different** source than the one that
+  raised it. An inspector's own find-it/fix-it/clear-it cycle (the same source raising and
+  clearing) is excluded — that's the trusted pattern Tier M/A already exists for, not this.
+- **`low_trust`** — a condition publishes having only ever been touched by Tier C sources (never
+  a Tier B/A/M report at any point in its history).
+- **`manual`** — a moderator queues an arbitrary spot directly.
+
+Priority combines a per-trigger base weight (`conflict` highest, then `reopen`, then `manual`,
+then `low_trust`) with proximity to spawn as a rough stand-in for actual road usage — there is no
+real traffic/query-count metric to rank against yet.
+
+**Fleet lifecycle**: the same registry token a bot already holds for `/report` (`full`/Tier A or
+`maintainer`/Tier M scope) polls `GET /dispatch/<server>`, claims an entry (`POST
+/dispatch/<id>/claim`), travels it, and either resolves it implicitly — its own fresh Tier A/M
+report at that exact spatial key auto-completes the claim — or explicitly via `POST
+/dispatch/<id>/complete`. An unclaimed entry expires after a while; a claimed entry with no
+resolution reverts to queued after a shorter timeout (the bot presumably went offline mid-trip).
+A moderator (or the Owner) can force-complete any claimed entry regardless of which token holds
+it, and can view the queue for visibility without holding a fleet token at all.
+
+**Not built (a separate, later phase, deliberately not attempted here):** the fleet-side (ABM)
+poller and travel-preference wiring that would actually route a bot toward a queued target.
+Passive piggyback (routing a bot anywhere already prefers a road with a pending target) comes
+before active dispatch (a bot travels specifically to verify) — active dispatch is reserved for
+high-priority contested entries given how expensive real travel is. This section is server-only;
+the queue exists and is fully functional, nothing yet reads it on the fleet side.
+
 ## 7. Consumption
 
 | route | method | auth | purpose |
@@ -558,6 +602,10 @@ cryptographic surface area worth its own careful pass rather than folding into t
 | `/moderation/quash` | POST | `moderator`/`admin` scope **for that server**, token or session | body `{server, road, seg, along, cond}` — removes a specific published condition outright — §6.5 |
 | `/identity/<server>/<discord_id>/suspend` | POST | `moderator`/`admin` scope **for that server**, token or session | suspend a Tier B (Discord) identity on that server only — §6.5 |
 | `/identity/<server>/<discord_id>/reinstate` | POST | `moderator`/`admin` scope **for that server**, token or session | reinstate a suspended Tier B identity on that server only — §6.5 |
+| `/dispatch/<server>` | GET | `full`/`maintainer` (fleet) token, or `moderator`/`admin` scope, **for that server** | list the open (queued/claimed) dispatch queue — §6.7 |
+| `/dispatch/<server>/queue` | POST | `moderator`/`admin` scope **for that server**, token or session | body `{road, seg, along}` — manually queue a spot — §6.7 |
+| `/dispatch/<id>/claim` | POST | `full`/`maintainer` (fleet) token **for the entry's own server** | claim a queued entry — §6.7 |
+| `/dispatch/<id>/complete` | POST | the claimant's own token, or `moderator`/`admin` scope for the entry's own server | resolve a claimed entry — §6.7 |
 | `/registry` | POST/GET/DELETE | Owner (all servers) or a dashboard `admin` session (own server(s) only) | issue/list/revoke registry tokens of any scope; issuing requires `server` in the body — §6.3/§6.6 |
 | `/admin/login` | POST | none (holds a Discord `discordCode` instead) | exchanges a Discord code for a session cookie, if that identity holds any `discord_grants` — §6.6 |
 | `/admin/logout` | POST | dashboard session | revokes the presented session — §6.6 |

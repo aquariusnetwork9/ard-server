@@ -1015,6 +1015,117 @@ class TrustedWriteCapTests(unittest.TestCase):
         self.assertEqual(body["tiers"], ["M"])
 
 
+class DispatchHttpTests(unittest.TestCase):
+    """SS6.5: auth surface for the dispatch queue -- fleet (A/M token) polls and
+    claims, moderator can view/manually-enqueue/force-complete, neither can do
+    the other's job. Own class/server: a dedicated fresh Store."""
+
+    @classmethod
+    def setUpClass(cls):
+        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-dispatch")
+        registry = trust.Registry()
+        registry.issue("dispatch-bot", "test-owner", trust.SCOPE_FULL, SERVER, token=FULL_TOKEN)
+        registry.issue("dispatch-crew", "test-owner", trust.SCOPE_MAINTAINER, SERVER, token=MAINTAINER_TOKEN)
+        registry.issue("dispatch-mod", "test-owner", trust.SCOPE_MODERATOR, SERVER, token=MODERATOR_TOKEN)
+        auth = Auth(registry, links=None, owner_hashes={Auth.hash_token(OWNER_TOKEN)})
+        cls.app = App(store, auth)
+        cls.srv = Server(("127.0.0.1", 0), cls.app)
+        cls.port = cls.srv.server_address[1]
+        cls.net = store.networks[SERVER]
+        cls.map = store.map_hashes[SERVER]
+        cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.t.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def a_report(self, x, cond="HOLE"):
+        return reference_client.build_report(x, 120, 0, "NETHER", self.net, self.map,
+                                             SERVER, cond=cond)
+
+    def manual_enqueue(self, x=9000):
+        r = self.a_report(x)
+        payload = {"road": r["road"], "seg": r["seg"], "along": r["along"]}
+        code, body = req("POST", self.url(f"/dispatch/{SERVER}/queue"),
+                         token=MODERATOR_TOKEN, body=payload)
+        self.assertEqual(code, 200)
+        return body["id"]
+
+    def test_manual_enqueue_requires_moderator_scope(self):
+        r = self.a_report(9010)
+        payload = {"road": r["road"], "seg": r["seg"], "along": r["along"]}
+        self.assertEqual(
+            req("POST", self.url(f"/dispatch/{SERVER}/queue"), token=FULL_TOKEN, body=payload)[0], 403)
+        self.assertEqual(
+            req("POST", self.url(f"/dispatch/{SERVER}/queue"), token=NOBODY_TOKEN, body=payload)[0], 403)
+
+    def test_list_requires_fleet_or_moderator_scope(self):
+        self.manual_enqueue(9020)
+        self.assertEqual(req("GET", self.url(f"/dispatch/{SERVER}"), token=NOBODY_TOKEN)[0], 403)
+        code, body = req("GET", self.url(f"/dispatch/{SERVER}"), token=FULL_TOKEN)
+        self.assertEqual(code, 200)
+        self.assertTrue(any(e["along"] == self.a_report(9020)["along"] for e in body["queue"]))
+        self.assertEqual(req("GET", self.url(f"/dispatch/{SERVER}"), token=MODERATOR_TOKEN)[0], 200)
+
+    def test_claim_requires_an_am_token_not_moderator(self):
+        did = self.manual_enqueue(9030)
+        self.assertEqual(
+            req("POST", self.url(f"/dispatch/{did}/claim"), token=MODERATOR_TOKEN)[0], 403)
+        self.assertEqual(
+            req("POST", self.url(f"/dispatch/{did}/claim"), token=NOBODY_TOKEN)[0], 403)
+        code, body = req("POST", self.url(f"/dispatch/{did}/claim"), token=FULL_TOKEN)
+        self.assertEqual(code, 200)
+        self.assertTrue(body["claimed"])
+
+    def test_double_claim_is_409(self):
+        did = self.manual_enqueue(9040)
+        req("POST", self.url(f"/dispatch/{did}/claim"), token=FULL_TOKEN)
+        code, body = req("POST", self.url(f"/dispatch/{did}/claim"), token=MAINTAINER_TOKEN)
+        self.assertEqual(code, 409)
+
+    def test_claim_unknown_id_is_404(self):
+        code, _ = req("POST", self.url("/dispatch/999999/claim"), token=FULL_TOKEN)
+        self.assertEqual(code, 404)
+
+    def test_complete_by_a_different_token_without_moderator_scope_is_409(self):
+        did = self.manual_enqueue(9050)
+        req("POST", self.url(f"/dispatch/{did}/claim"), token=FULL_TOKEN)
+        code, _ = req("POST", self.url(f"/dispatch/{did}/complete"), token=MAINTAINER_TOKEN)
+        self.assertEqual(code, 409)
+        code, body = req("POST", self.url(f"/dispatch/{did}/complete"), token=FULL_TOKEN)
+        self.assertEqual(code, 200)
+        self.assertTrue(body["completed"])
+
+    def test_moderator_can_force_complete_someone_elses_claim(self):
+        did = self.manual_enqueue(9060)
+        req("POST", self.url(f"/dispatch/{did}/claim"), token=FULL_TOKEN)
+        code, body = req("POST", self.url(f"/dispatch/{did}/complete"), token=MODERATOR_TOKEN)
+        self.assertEqual(code, 200)
+        self.assertTrue(body["completed"])
+
+    def test_owner_can_force_complete_too(self):
+        did = self.manual_enqueue(9070)
+        req("POST", self.url(f"/dispatch/{did}/claim"), token=MAINTAINER_TOKEN)
+        code, body = req("POST", self.url(f"/dispatch/{did}/complete"), token=OWNER_TOKEN)
+        self.assertEqual(code, 200)
+        self.assertTrue(body["completed"])
+
+    def test_complete_unclaimed_entry_is_409(self):
+        did = self.manual_enqueue(9080)
+        code, _ = req("POST", self.url(f"/dispatch/{did}/complete"), token=FULL_TOKEN)
+        self.assertEqual(code, 409)
+
+    def test_manual_enqueue_is_scoped_to_its_own_server(self):
+        # MODERATOR_TOKEN is only scoped on SERVER, not SERVER2.
+        payload = {"road": 0, "seg": 0, "along": 0}
+        self.assertEqual(
+            req("POST", self.url(f"/dispatch/{SERVER2}/queue"), token=MODERATOR_TOKEN, body=payload)[0], 403)
+
+
 
 if __name__ == "__main__":
     unittest.main()
