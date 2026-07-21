@@ -191,7 +191,7 @@ class Store:
     """Geometry + SQLite aggregation. No HTTP; unit-testable in isolation."""
 
     def __init__(self, geometry_dir, db_path=":memory:", bucket=DEFAULT_BUCKET,
-                 k_anon=2, k_tier_b=2, ttl=3600, clear_factor=2, reopen_window=3600,
+                 k_anon=4, k_tier_b=2, ttl=3600, clear_factor=2, reopen_window=3600,
                  salt=None, clock=time.time, max_travel_speed=MAX_TRAVEL_SPEED_DEFAULT,
                  on_event=None):
         self.bucket = bucket
@@ -1666,6 +1666,11 @@ def apply_env_secrets(args, environ=None):
         args.ntfy_url = environ.get("ARD_NTFY_URL") or None
     if not getattr(args, "ntfy_token", None):
         args.ntfy_token = environ.get("ARD_NTFY_TOKEN") or None
+    if not getattr(args, "min_discord_age_days", 0):
+        try:
+            args.min_discord_age_days = int(environ.get("ARD_MIN_DISCORD_AGE_DAYS", "0") or "0")
+        except ValueError:
+            raise SystemExit("ARD_MIN_DISCORD_AGE_DAYS must be an integer number of days")
     return args
 
 
@@ -1700,7 +1705,8 @@ def build_app(args):
     _seed_registry(registry, args.seed_token)
     _seed_discord_admins(registry, args.discord_admin)
     links = identity.LinkStore(db_path=args.identity_db, link_code_ttl=args.link_code_ttl,
-                                max_linked_uids=args.max_linked_uids)
+                                max_linked_uids=args.max_linked_uids,
+                                min_discord_age=getattr(args, "min_discord_age_days", 0) * 86400)
     session_store = sessions_mod.SessionStore(db_path=args.session_db, session_ttl=args.session_ttl)
     cfg = {}
     if args.tokens_file and Path(args.tokens_file).exists():
@@ -1729,7 +1735,7 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8788)
     ap.add_argument("--db", default=":memory:")
     ap.add_argument("--bucket", type=int, default=DEFAULT_BUCKET)
-    ap.add_argument("--k-anon", type=int, default=2,
+    ap.add_argument("--k-anon", type=int, default=4,
                      help="Tier C (anonymous, IP-hash) corroboration threshold (K_TIER_C_NEW)")
     ap.add_argument("--k-tier-b", type=int, default=2,
                      help="Tier B (Discord-verified identity) corroboration threshold "
@@ -1766,6 +1772,9 @@ def main(argv=None):
                      help="SQLite path for the Tier B link store (PROTOCOL.md SS6.2)")
     ap.add_argument("--link-code-ttl", type=int, default=identity.DEFAULT_LINK_CODE_TTL,
                      help="seconds an unclaimed /link/init code stays valid (LINK_CODE_TTL)")
+    ap.add_argument("--min-discord-age-days", type=int, default=0,
+                     help="minimum Discord account age (days) to complete a Tier B link; "
+                          "0 disables -- or set ARD_MIN_DISCORD_AGE_DAYS")
     ap.add_argument("--max-linked-uids", type=int, default=identity.DEFAULT_MAX_LINKED_UIDS,
                      help="max Minecraft UIDs one Discord identity may link (MAX_LINKED_UIDS)")
     ap.add_argument("--discord-client-id", help="Discord OAuth app client ID")

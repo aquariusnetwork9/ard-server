@@ -33,8 +33,9 @@ it before constructing any report object**. It is never transmitted, bucketed, o
 | `TTL` | `10800` (3h) | condition decay window (§6.1) — tripled from an original 1h default: highway traffic density varies a lot across the network, and a sparsely-traveled road shouldn't expire before someone else happens to pass through and refresh it |
 | `LINK_CODE_TTL` | `600` (10 min) | seconds an unclaimed account-link code stays valid |
 | `MAX_LINKED_UIDS` | `8` | max Minecraft UIDs one Discord identity may link (multiboxer allowance) |
-| `K_TIER_C_NEW` | `4` | distinct Tier C (IP-hash) sources required to publish a *new* condition |
+| `K_TIER_C_NEW` | `4` | distinct Tier C (IP-hash) sources required to publish a *new* condition — the `--k-anon` default matched this spec value as of 0.1.3 (it had shipped at 2, a standing doc/config mismatch) |
 | `K_TIER_B_NEW` | `2` | distinct Tier B (Discord identity) sources required to publish a *new* condition |
+| `MIN_DISCORD_ACCOUNT_AGE` | `0` (off) | minimum Discord account age to complete a Tier B link (`--min-discord-age-days`/`ARD_MIN_DISCORD_AGE_DAYS`); derived from the snowflake id itself, no extra API call — see §6.2 |
 | `K_CLEAR_FACTOR` | `2×` | CLEAR/downgrade reports require this multiple of the tier's normal `k` — see §6.4 |
 | `MAINTAINER_REOPEN_WINDOW` | `3600` (1h) | a published clear reopened within this window routes to `/moderation` — see §6.4 |
 | `MAX_TRAVEL_SPEED` | `100` blocks/sec | above this implied speed between an identity's two claimed positions, the newer report doesn't corroborate anything — see §6.1.1 |
@@ -304,6 +305,16 @@ every other unauthenticated write surface. A moderator can suspend a Discord ide
 own server (`POST /identity/<server>/<discord_id>/suspend`, §6.5) — its tokens on that server then
 simply fail to resolve and any report through them falls back to Tier C rather than being
 rejected outright; the identity's standing on any other server is untouched.
+
+**Minimum account age (0.1.3, `MIN_DISCORD_ACCOUNT_AGE`):** when configured, `complete_link`
+rejects a Discord identity younger than the threshold — raising the cost of Tier B from "any
+freshly created account" to "an account that predates the campaign." The age comes from the
+snowflake id's embedded creation timestamp (Discord's documented id format), so this adds no
+API call and no extra OAuth scope; both completion paths (§6.2 website OAuth and §6.2.1
+bot-complete) pass through the same check. An id that doesn't parse as a snowflake skips the
+check rather than hard-failing (only test fakes ever look like that). This is the cheap tier of
+the §A4 ladder — the strong fix (a Mojang session-server `hasJoined` proof that the producer
+actually holds the MC account it claims at `/link/init` time) remains a future, bigger phase.
 
 #### 6.2.1 Bot-authenticated completion (`POST /link/bot-complete`)
 

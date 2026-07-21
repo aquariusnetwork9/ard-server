@@ -265,5 +265,50 @@ class DiscordExchangeTests(unittest.TestCase):
             identity.discord_exchange("CID", "CSECRET", "https://example.test/link.html", "CODE")
 
 
+class DiscordAgeGateTests(unittest.TestCase):
+    """Optional minimum-account-age gate on Tier B linking, derived from the
+    snowflake id itself (no API call)."""
+
+    NOW = 1_750_000_000.0  # a realistic present -- snowflakes date from 2015 on
+
+    @staticmethod
+    def snowflake(created_s):
+        return str((int(created_s * 1000) - identity._DISCORD_EPOCH_MS) << 22)
+
+    def setUp(self):
+        self.clock = Clock(self.NOW)
+        self.store = identity.LinkStore(link_code_ttl=600, max_linked_uids=2,
+                                        clock=self.clock, min_discord_age=7 * 86400)
+
+    def test_age_helper_reads_the_snowflake(self):
+        age = identity.discord_account_age_seconds(self.snowflake(self.NOW - 3600), self.NOW)
+        self.assertAlmostEqual(age, 3600, delta=1)
+        self.assertIsNone(identity.discord_account_age_seconds("not-a-snowflake", self.NOW))
+
+    def test_too_new_account_cannot_link(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        fresh = self.snowflake(self.NOW - 86400)  # 1 day old, gate needs 7
+        with self.assertRaises(ValueError) as cm:
+            self.store.complete_link(code, fresh)
+        self.assertIn("too new", str(cm.exception))
+
+    def test_aged_account_links_fine(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        aged = self.snowflake(self.NOW - 30 * 86400)
+        _id, token = self.store.complete_link(code, aged)
+        self.assertEqual(self.store.discord_identity_for(token, S1), aged)
+
+    def test_non_snowflake_id_skips_the_check(self):
+        # Only ever seen from test fakes; a real Discord id is always a snowflake.
+        code = self.store.init_link("mc-uid-1", S1)
+        self.store.complete_link(code, "discord-fake-1")  # must not raise
+
+    def test_gate_off_by_default(self):
+        store = identity.LinkStore(link_code_ttl=600, max_linked_uids=2, clock=self.clock)
+        code = store.init_link("mc-uid-1", S1)
+        store.complete_link(code, self.snowflake(self.NOW - 60))  # brand new, no gate -> fine
+
+
+
 if __name__ == "__main__":
     unittest.main()

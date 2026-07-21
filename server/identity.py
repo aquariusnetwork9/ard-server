@@ -34,6 +34,23 @@ import urllib.error
 
 DEFAULT_LINK_CODE_TTL = 600          # PROTOCOL.md LINK_CODE_TTL
 DEFAULT_MAX_LINKED_UIDS = 8          # PROTOCOL.md MAX_LINKED_UIDS
+DEFAULT_MIN_DISCORD_AGE = 0          # seconds; 0 = no minimum (PROTOCOL.md MIN_DISCORD_ACCOUNT_AGE)
+
+# Discord's snowflake epoch (2015-01-01T00:00:00Z, ms). A snowflake's high bits are
+# its creation timestamp, so an account's age is derivable from its id alone -- no
+# API call, no extra scope.
+_DISCORD_EPOCH_MS = 1420070400000
+
+
+def discord_account_age_seconds(discord_id, now):
+    """Age of a Discord account in seconds, read straight from its snowflake id.
+    None if the id isn't a parseable snowflake (in which case callers skip the
+    age check rather than guessing)."""
+    try:
+        created_ms = (int(discord_id) >> 22) + _DISCORD_EPOCH_MS
+    except (ValueError, TypeError):
+        return None
+    return now - created_ms / 1000.0
 
 
 def _format_code(raw_hex):
@@ -44,9 +61,11 @@ def _format_code(raw_hex):
 
 class LinkStore:
     def __init__(self, db_path=":memory:", link_code_ttl=DEFAULT_LINK_CODE_TTL,
-                 max_linked_uids=DEFAULT_MAX_LINKED_UIDS, clock=time.time):
+                 max_linked_uids=DEFAULT_MAX_LINKED_UIDS, clock=time.time,
+                 min_discord_age=DEFAULT_MIN_DISCORD_AGE):
         self.link_code_ttl = link_code_ttl
         self.max_linked_uids = max_linked_uids
+        self.min_discord_age = min_discord_age
         self.clock = clock
         self._lock = threading.RLock()
         self.db = sqlite3.connect(db_path, check_same_thread=False)
@@ -178,6 +197,17 @@ class LinkStore:
                 raise ValueError("link code already used")
             if now - created_at > self.link_code_ttl:
                 raise ValueError("link code expired")
+
+            if self.min_discord_age > 0:
+                # Age comes from the snowflake itself; an id that doesn't parse as
+                # one skips the check (only ever seen from test fakes -- real
+                # Discord ids are always snowflakes) rather than hard-failing.
+                age = discord_account_age_seconds(discord_id, now)
+                if age is not None and age < self.min_discord_age:
+                    days = self.min_discord_age // 86400
+                    raise ValueError(
+                        f"this Discord account is too new to link here "
+                        f"(minimum account age: {days} days)")
 
             self.db.execute(
                 "INSERT INTO identities(discord_id,server,created_at) VALUES(?,?,?)"

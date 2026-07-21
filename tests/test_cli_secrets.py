@@ -84,6 +84,15 @@ class ApplyEnvSecretsTests(unittest.TestCase):
         self.assertEqual(args.ntfy_url, "https://ntfy.test/t")
         self.assertEqual(args.ntfy_token, "tk")
 
+    def test_min_discord_age_env(self):
+        args = apply_env_secrets(_args(), environ={"ARD_MIN_DISCORD_AGE_DAYS": "14"})
+        self.assertEqual(args.min_discord_age_days, 14)
+        args = apply_env_secrets(_args(min_discord_age_days=7),
+                                  environ={"ARD_MIN_DISCORD_AGE_DAYS": "14"})
+        self.assertEqual(args.min_discord_age_days, 7, "CLI wins over env")
+        with self.assertRaises(SystemExit):
+            apply_env_secrets(_args(), environ={"ARD_MIN_DISCORD_AGE_DAYS": "soon"})
+
     def test_ntfy_cli_wins_over_env(self):
         args = apply_env_secrets(_args(ntfy_url="https://cli.test/t", ntfy_token="cli-tk"),
                                   environ={"ARD_NTFY_URL": "https://env.test/t",

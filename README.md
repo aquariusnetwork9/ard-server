@@ -45,7 +45,7 @@ python server/highway_conditions.py --geometry ./geometry --port 8788 \
 
 See `PROTOCOL.md §6`/`§7` for the full route table, env vars (`ARD_OWNER_TOKEN`,
 `ARD_SEED_TOKENS`, `ARD_DISCORD_CLIENT_SECRET`, `ARD_DISCORD_ADMINS`, `ARD_BOT_SECRET`,
-`ARD_TRUSTED_PROXIES`, `ARD_NTFY_URL`/`ARD_NTFY_TOKEN` for ops alerts), and deploy notes
+`ARD_TRUSTED_PROXIES`, `ARD_NTFY_URL`/`ARD_NTFY_TOKEN` for ops alerts, `ARD_MIN_DISCORD_AGE_DAYS`), and deploy notes
 (secrets via environment, never CLI flags, on a shared box).
 
 ## Keeping this in sync with the public repo
