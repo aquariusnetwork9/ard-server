@@ -12,6 +12,10 @@
  *   moderator scope            -> Highway Patrol   -- manual
  *   admin scope / server owner -> Director          -- manual, owner-assigned only
  *   (no ARD equivalent)        -> Branch Director   -- manual, group/crew leadership
+ *   (no ARD equivalent)        -> Dispatcher         -- manual, staff-granted; a vetted Highway
+ *                                                       Worker earns dispatch-queue access this
+ *                                                       way, same as Tier A/M already have via
+ *                                                       their own rank (PROTOCOL.md SS6.7)
  *
  * Highway Worker and Highway Supervisor split per-server (2b2t/6b6t) because
  * ARD's own Tier A/B grants are strictly per-server -- someone verified on
@@ -39,10 +43,39 @@ export const ROLES: RoleSpec[] = [
   { name: '2b2t Highway Supervisor', color: 0x1f8b4c, hoist: true },
   { name: '6b6t Highway Supervisor', color: 0x206694, hoist: true },
   { name: 'Highway Inspector', color: 0xf1c40f, hoist: true },
+  // Manual, staff-granted only -- deliberately no self-serve command (see
+  // ard-server PROTOCOL.md SS6.7). A Highway Worker who's earned this can
+  // claim/complete dispatch targets in Dispatch Center; Tier A/M members
+  // never need it themselves (their existing Supervisor/Inspector rank
+  // already grants Dispatch Center access -- see DISPATCH_ACCESS_ROLES).
+  { name: 'Dispatcher', color: 0x11cdef, hoist: true },
   { name: 'Highway Patrol', color: 0xed4245, hoist: true, oldNames: ['Moderator'] },
   { name: 'Director', color: 0x9b59b6, hoist: true },
   { name: 'Branch Director', color: 0x71368a, hoist: true },
 ];
+
+// Who can see/use the Dispatch Center category (structure below): every
+// per-server Tier A rank plus Tier M's own badge role -- Highway Inspector is
+// deliberately listed here even though CATEGORIES below otherwise follows the
+// "Inspector carries no channel grants of its own" convention (see the module
+// note above and moderation.ts's STAFF_ROLES) -- dispatch access specifically
+// IS an Inspector's own real capability (ard-server's bot-mediated auth
+// treats Tier A/M as having default access), not something they only get
+// through a Worker/Supervisor role held on the side.
+export const DISPATCH_ACCESS_ROLES = [
+  '2b2t Highway Supervisor', '6b6t Highway Supervisor', 'Highway Inspector', 'Dispatcher',
+];
+
+// Exact channel names -- shared between the CATEGORIES declaration below and
+// the dispatch poller (discord/dispatch/poller.ts), which looks these up by
+// name at runtime independent of any /setup run. One definition so the two
+// can never drift apart.
+export const DISPATCH_CHANNEL_NAMES = {
+  open: '🎯・open',
+  barracks: '🪖・dispatch-barracks',
+  closed: '📦・closed',
+  records: '📜・records',
+} as const;
 
 // Maps the ARD `server` field (from /link/bot-complete's response) to the
 // Discord role /link grants automatically.
@@ -128,6 +161,33 @@ export const CATEGORIES: CategorySpec[] = [
       { name: '🗨️・6b6t-general', oldNames: ['6b6t-general'] },
       { name: '🗺️・6b6t-highway-map', topic: 'https://map.aquariusconnect.org', oldNames: ['6b6t-highway-map'] },
       { name: '🆘・6b6t-help', oldNames: ['6b6t-help'] },
+    ],
+  },
+  {
+    name: '🛰️ Dispatch Center',
+    // See DISPATCH_ACCESS_ROLES's own comment for why Highway Inspector is
+    // listed directly here, unlike everywhere else in this file.
+    visibleTo: [...DISPATCH_ACCESS_ROLES, ...STAFF_ROLES],
+    channels: [
+      {
+        name: DISPATCH_CHANNEL_NAMES.open,
+        topic: 'Open dispatch targets -- claim one with the button on its post.',
+        readOnly: true,
+      },
+      {
+        name: DISPATCH_CHANNEL_NAMES.barracks,
+        topic: 'Coordination for whoever\'s actively out on a claim.',
+      },
+      {
+        name: DISPATCH_CHANNEL_NAMES.closed,
+        topic: 'Recently resolved dispatch targets.',
+        readOnly: true,
+      },
+      {
+        name: DISPATCH_CHANNEL_NAMES.records,
+        topic: 'Full dispatch audit log -- every claim, completion, and expiry.',
+        readOnly: true,
+      },
     ],
   },
   {

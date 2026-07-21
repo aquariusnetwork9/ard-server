@@ -5,6 +5,7 @@ import * as setupCommand from './discord/commands/setup';
 import * as cleanupCommand from './discord/commands/cleanup';
 import { TRAVELER_ROLE } from './discord/provision/structure';
 import { claimSession, isCurrentSession } from './runtime-lock';
+import { startDispatchPolling, handleDispatchButton } from './discord/dispatch/poller';
 
 interface Command {
   data: { name: string; toJSON: () => unknown };
@@ -58,6 +59,7 @@ client.once('ready', async () => {
     // process is restarted.
     console.error('[commands] Failed to register slash commands:', err);
   }
+  startDispatchPolling(client);
 });
 
 client.on('guildMemberAdd', async member => {
@@ -72,6 +74,24 @@ client.on('guildMemberAdd', async member => {
 });
 
 client.on('interactionCreate', async interaction => {
+  if (interaction.isButton() && interaction.customId.startsWith('dispatch:')) {
+    if (!(await isCurrentSession())) {
+      await interaction.reply({ content: 'This bot process is stale -- a newer instance should handle this. Try again.', ephemeral: true }).catch(() => {});
+      return;
+    }
+    try {
+      await handleDispatchButton(interaction);
+    } catch (err) {
+      console.error('[dispatch] Button handler failed:', err);
+      const payload = { content: 'Something went wrong handling that button.', ephemeral: true };
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply(payload).catch(() => {});
+      } else {
+        await interaction.reply(payload).catch(() => {});
+      }
+    }
+    return;
+  }
   if (!interaction.isChatInputCommand()) return;
   const command = commands.get(interaction.commandName);
   if (!command) return;
