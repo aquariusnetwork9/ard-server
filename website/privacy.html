@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aquarius Road Department — privacy policy</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="doc-body">
+<div class="doc-wrap">
+
+<a id="doc-back-link" href="/">← back to the map</a>
+
+<h1>Privacy Policy — Aquarius Road Department</h1>
+<p class="doc-meta">Effective / last updated: 2026-07-19</p>
+
+<p class="doc-lede">The short version: we don't want your data. Aquarius Road Department (ARD)
+is built so that the thing most worth protecting — where you actually are or live on 2b2t/6b6t —
+is <strong>never collected in the first place</strong>, not filtered out after the fact. Beyond
+that, we collect as little as the project needs to function, we don't sell it, we don't share it
+with advertisers or data brokers, and we don't run analytics or tracking on this site.</p>
+
+<h2>What this project is</h2>
+<p>ARD is a crowdsourced map of nether-highway conditions (holes, lava, roadblocks, etc.) for
+anarchy Minecraft servers, fed by a proxy plugin / client mod and shown at
+<a href="https://map.aquariusconnect.org">map.aquariusconnect.org</a>. The full technical
+protocol is public: <a href="https://github.com/aquariusnetwork9/Aquarius-Road-Department/blob/main/PROTOCOL.md">PROTOCOL.md</a>.
+This page is the plain-language privacy summary; if the two ever disagree, treat this page as
+authoritative for how your data is actually handled — the repo doc is the source of truth for
+how the system is built to enforce it.</p>
+
+<h2>The one guarantee that matters most</h2>
+<p>Your real in-game coordinates <strong>cannot</strong> be reconstructed from anything this
+project transmits or stores, even by us. The wire format has no `(x, z)` field at all — a
+contributor's client sends only an abstract, 1-D "how far along this known public road" value.
+The one piece of information that could actually locate you (how far <em>off</em> that road you
+were) is computed locally on your own device for a one-time sanity check and is discarded before
+any report is built — it is never sent, never logged, never stored, anywhere, by anyone.</p>
+
+<h2>What we collect, and why</h2>
+<ul>
+<li><strong>Just browsing the map:</strong> nothing beyond ordinary web-server connection
+  handling (see "Logging" below). No account, no login, no cookie, no tracking script.</li>
+<li><strong>Submitting a road-condition report</strong> (via the proxy plugin or client mod):
+  the abstract on-road location above, the condition type, and — depending on how the report is
+  authorized — either your IP address or a linked Discord identity, used <em>transiently</em> to
+  compute a one-way corroboration signal (see "How we protect what we do collect"). Neither the
+  raw IP nor the raw Discord ID is stored alongside the report itself.</li>
+<li><strong>Linking a Discord account</strong> (optional, only if you choose to for a lower
+  corroboration threshold): we request only Discord's <code>identify</code> OAuth scope, and
+  from Discord's response we extract and store <em>only your numeric Discord user ID</em> —
+  nothing else Discord returns (username, avatar, discriminator, etc.) is read or stored. We
+  never request the <code>email</code> scope and never see or store your email address, and we
+  never see your Discord password (Discord's own login page handles that, not us). We also
+  store the Minecraft UID you're linking it to, since that's the whole point of the link.</li>
+<li><strong>Admin/moderator dashboard login:</strong> the same Discord <code>identify</code>
+  exchange as above, plus a session cookie — a random token whose hash (not the raw token) is
+  what's actually stored, expires automatically within hours, and is only ever issued to a
+  Discord identity someone has explicitly granted dashboard access to.</li>
+</ul>
+
+<h2>What we deliberately do <em>not</em> collect</h2>
+<ul>
+<li>Real, absolute in-game coordinates — architecturally impossible to submit, see above.</li>
+<li>Your Discord email address, phone number, or any Discord scope beyond <code>identify</code>.</li>
+<li>Any payment, billing, or financial information — this project doesn't charge for anything.</li>
+<li>Analytics, ad-tracking, or third-party tracking scripts of any kind. The map itself is
+  rendered with a copy of Leaflet hosted on our own server, not loaded from a third-party CDN —
+  your browser doesn't make requests to anyone but this site just to view the map.</li>
+<li>A persistent, cross-session tracking cookie. The only cookie this site ever sets is the
+  short-lived admin/moderator session above, and only for people who deliberately sign in for
+  that purpose.</li>
+</ul>
+
+<h2>How we protect what we do collect</h2>
+<ul>
+<li><strong>Bearer tokens and session cookies:</strong> only a one-way SHA-256 hash is ever
+  stored. The raw value is shown to you once, at issue time, and we cannot recover it afterward
+  — if you lose it, we revoke and reissue rather than "look it up."</li>
+<li><strong>IP addresses and Discord IDs used for anonymous/Tier-B report corroboration:</strong>
+  used only in memory, for the moment it takes to compute a salted SHA-256 hash scoped to that
+  specific report location and condition type — the same input hashed for a different spot, or
+  a different condition at the same spot, produces an unrelated, uncorrelatable hash. The salt
+  is a random value generated fresh at process start and is not persisted, so it changes on
+  every service restart. The raw IP/Discord ID is never written to disk.</li>
+<li><strong>Report data expires.</strong> Conditions and their corroboration records are
+  automatically dropped after a few hours of no fresh confirmation (a "decay window") — we're
+  not building a permanent historical record of anyone's activity, just a live conditions feed.</li>
+<li><strong>Revocation is real and immediate.</strong> A moderator or admin grant, a bearer
+  token, or a linked account can be revoked or suspended, and it stops working on the very next
+  request — there's no cache or delay to worry about.</li>
+</ul>
+
+<h2>Logging</h2>
+<p>The server process does not write a per-request access log at all — no method, path, query
+string, or client IP is written to disk or process output for ordinary map/report/API traffic.
+Coordinates are never logged anywhere in this codebase, full stop, regardless of report tier.</p>
+<p>This site is reached through Cloudflare (for TLS and a private tunnel to the box it runs on,
+so nothing is directly exposed to the internet). Cloudflare, as our connection provider, sees
+standard connection metadata for requests to this domain the same way it would for any site
+using it — that's between you, Cloudflare, and <a href="https://www.cloudflare.com/privacypolicy/" target="_blank" rel="noopener">their own privacy policy</a>, not something we
+query, store, or use for tracking.</p>
+
+<h2>Third parties</h2>
+<p>Two, and only for the features that need them:</p>
+<ul>
+<li><strong>Discord</strong> — handles the actual login/consent step if you choose to link an
+  account or sign into the dashboard. See <a href="https://discord.com/privacy" target="_blank" rel="noopener">Discord's privacy policy</a> for what they collect on their side; we only
+  ever receive what's described above.</li>
+<li><strong>Cloudflare</strong> — TLS and network transport for this domain, as described above.</li>
+</ul>
+<p>We do not use any analytics provider, ad network, or data broker. We do not sell, rent, or
+otherwise share your data with anyone, for any reason, ever.</p>
+
+<h2>Your data, your choices</h2>
+<ul>
+<li>Linking a Discord/Minecraft account is entirely optional — the project works anonymously
+  (Tier C) with no linked identity at all, just at a higher corroboration threshold.</li>
+<li>To unlink or have a linked identity suspended, contact the project maintainer (see below).
+  Since a linked identity is just a Discord ID, unlinking removes essentially all of what we
+  held about you.</li>
+<li>Since the wire protocol never carries an absolute coordinate, there is no "delete my
+  location history" request to make — that history doesn't exist to begin with.</li>
+</ul>
+
+<h2>Legal requests</h2>
+<p>We don't sell or share data, and we push back on any request — legal or otherwise — that asks
+for more than what's actually described on this page. In practice, the strongest protection here
+isn't a promise to resist disclosure; it's that the system is built so there is very little to
+disclose in the first place, and the one thing that would actually matter (your real location)
+is architecturally never collected at all.</p>
+
+<h2>Changes to this policy</h2>
+<p>If this changes, we'll update the date at the top of this page. Given the project's whole
+design premise is collecting less, not more, we don't expect this policy to grow.</p>
+
+<h2>Contact</h2>
+<p>Questions, deletion requests, or concerns: open an issue on the
+<a href="https://github.com/aquariusnetwork9/Aquarius-Road-Department/issues" target="_blank" rel="noopener">GitHub repository</a>.</p>
+
+<p><a href="/terms.html">Terms of service →</a></p>
+
+</div>
+</body>
+</html>

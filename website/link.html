@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aquarius Road Department — link your account</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="link-body">
+<div class="link-card">
+  <div id="brand-name">Aquarius Road Department</div>
+  <h1 id="link-title">Link your Minecraft account</h1>
+  <p id="link-explain" class="link-dim">
+    Enter the code your proxy or client mod showed you, then continue with Discord. This links
+    your Minecraft UID to your Discord identity (Tier B) — no password, no bot invite, just an
+    identity check.
+  </p>
+
+  <div id="step-code">
+    <label for="code-input" class="link-dim">Link code</label>
+    <input id="code-input" type="text" placeholder="XXXX-XXXX" autocomplete="off" spellcheck="false">
+    <button id="continue-btn" disabled>Continue with Discord</button>
+    <div id="step-code-error" class="link-error"></div>
+  </div>
+
+  <div id="step-working" class="hidden">
+    <div class="spinner"></div>
+    <p class="link-dim">Completing sign-in…</p>
+  </div>
+
+  <div id="step-done" class="hidden">
+    <p class="link-ok">Linked! Here's your Tier B token — save it now, it's shown only once:</p>
+    <div id="token-box"></div>
+    <button id="copy-btn">Copy</button>
+    <p class="link-dim">Paste this into your proxy plugin or client mod's config as its report
+      token.</p>
+  </div>
+
+  <div id="step-admin-done" class="hidden">
+    <p class="link-ok">Signed in.</p>
+    <a id="admin-continue-link" href="/admin/">Continue to the dashboard →</a>
+  </div>
+
+  <div id="step-error" class="hidden">
+    <p class="link-error" id="error-text"></p>
+    <a href="/link.html">Try again</a>
+  </div>
+
+  <a id="back-link" href="/">← back to the map</a>
+  <a id="privacy-footer-link" href="/privacy.html">privacy policy</a>
+  <a id="terms-footer-link" href="/terms.html">terms of service</a>
+</div>
+
+<script src="/link.js"></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+# Secrets — never commit tokens
+tokens.json
+hc_config.json
+*.secret
+
+# Runtime state
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]

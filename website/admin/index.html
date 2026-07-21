@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aquarius Road Department — admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Sora:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/admin/admin.css">
+</head>
+<body class="admin-body">
+
+<div class="a-topbar">
+  <div class="a-brand"><span class="a-dot"></span><span>Aquarius Road Department<small>ADMIN</small></span></div>
+  <div class="a-sp"></div>
+  <div id="admin-who" class="a-who hidden">
+    <span id="admin-discord-id" class="a-chip"></span>
+    <button id="logout-btn" class="btn ghost">Log out</button>
+  </div>
+</div>
+
+<main class="a-wrap">
+
+  <div id="gate" class="a-gate">
+    <div class="a-gate-card" id="gate-card">
+      <div class="a-gate-ic">🛡️</div>
+      <h1>Sign in</h1>
+      <p class="a-dim">Dashboard access is granted per Discord identity — see the Owner if
+        you need a grant. There's no separate password: your Discord account is the credential.</p>
+      <button id="login-btn" class="btn go wide">Login with Discord</button>
+      <div id="gate-error" class="a-error"></div>
+      <a href="/privacy.html" class="a-footlink">privacy policy</a>
+      <a href="/terms.html" class="a-footlink">terms of service</a>
+    </div>
+  </div>
+
+  <div id="dash" class="hidden">
+    <div class="a-strip">
+      <div class="a-field">
+        <label for="server-tabs">Server</label>
+        <select id="server-tabs"></select>
+      </div>
+      <span id="server-scope-badge" class="a-pill"></span>
+    </div>
+
+    <div class="a-ws">
+      <div class="a-col">
+        <section id="panel-moderation" class="a-panel hidden">
+          <h3>🚧 Moderation queue<span class="sub" id="mod-count"></span></h3>
+          <div id="mod-list" class="a-list"></div>
+        </section>
+
+        <section id="panel-identity" class="a-panel hidden">
+          <h3>👤 Identity actions</h3>
+          <div class="a-form">
+            <input id="identity-discord-id" placeholder="Discord user ID">
+            <button id="identity-suspend-btn" class="btn warn">Suspend</button>
+            <button id="identity-reinstate-btn" class="btn go">Reinstate</button>
+          </div>
+          <div id="identity-result" class="a-dim" style="margin:.5rem 0 0"></div>
+        </section>
+      </div>
+
+      <div class="a-col">
+        <section id="panel-registry" class="a-panel hidden">
+          <h3>🔑 Registry tokens<span class="sub" id="reg-count"></span></h3>
+          <div id="registry-list" class="a-list"></div>
+          <details>
+            <summary>Issue a new token</summary>
+            <div class="a-form">
+              <input id="reg-label" placeholder="holder label, e.g. highway-crew-2">
+              <select id="reg-scope">
+                <option value="full">full (Tier A)</option>
+                <option value="maintainer">maintainer (Tier M)</option>
+                <option value="moderator">moderator</option>
+              </select>
+              <button id="reg-issue-btn" class="btn go">Issue</button>
+            </div>
+            <div id="reg-new-token" class="hidden">
+              <p class="a-ok">New token — copy it now, it's shown only once:</p>
+              <div id="reg-new-token-box"></div>
+            </div>
+          </details>
+        </section>
+
+        <section id="panel-grants" class="a-panel hidden">
+          <h3>🛂 Dashboard access<span class="sub" id="grants-count"></span></h3>
+          <div id="grants-list" class="a-list"></div>
+          <details>
+            <summary>Grant moderator access on this server</summary>
+            <div class="a-form">
+              <input id="grant-discord-id" placeholder="Discord user ID">
+              <button id="grant-issue-btn" class="btn go">Grant moderator</button>
+            </div>
+          </details>
+          <details>
+            <summary>Owner actions (grant/revoke admin scope)</summary>
+            <p class="a-dim">Minting or revoking <b>admin</b> scope always requires the Owner
+              secret directly, kept out of your session on purpose — paste it here only when
+              you need it. It's held in this tab's memory only, never stored or sent anywhere
+              except as the request you trigger below.</p>
+            <input id="owner-token-input" type="password" placeholder="Owner token" autocomplete="off">
+            <div class="a-form">
+              <input id="admin-grant-discord-id" placeholder="Discord user ID">
+              <button id="admin-grant-issue-btn" class="btn go">Grant admin</button>
+            </div>
+          </details>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="hidden"></div>
+</main>
+
+<script src="/admin/app.js"></script>
+</body>
+</html>

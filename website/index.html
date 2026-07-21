@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aquarius Road Department — live highway conditions</title>
+<link rel="stylesheet" href="/vendor/leaflet.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div id="brand">
+    <span id="brand-name">Aquarius Road Department</span>
+    <span id="brand-sub">live nether-highway conditions</span>
+  </div>
+  <div id="controls">
+    <label for="server-select">server</label>
+    <select id="server-select"></select>
+    <span id="conn-dot" class="dot" title="connection status"></span>
+  </div>
+</header>
+
+<div id="map"></div>
+<div id="coord-tooltip" class="hidden"></div>
+
+<aside id="legend">
+  <div class="legend-title">conditions</div>
+  <div id="legend-items"></div>
+  <div class="legend-title">status</div>
+  <div id="status-line">loading…</div>
+  <a id="link-account-link" href="/link.html">link your account (Tier B)</a>
+  <a id="admin-link" href="/admin/">moderator / admin dashboard</a>
+  <a id="protocol-link" href="https://github.com/aquariusnetwork9/Aquarius-Road-Department#readme"
+     target="_blank" rel="noopener">about / PROTOCOL.md</a>
+  <a id="privacy-link" href="/privacy.html">privacy policy</a>
+  <a id="terms-link" href="/terms.html">terms of service</a>
+</aside>
+
+<script src="/vendor/leaflet.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

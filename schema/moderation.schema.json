@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aquariusnetwork9/highway-conditions/schema/moderation.schema.json",
+  "title": "Moderation-queue submission (anomaly)",
+  "description": "For observations the strict auto-report gate rejects but that may be legitimately new (e.g. a road at a Y other than 120, or a plausible on-line position on a road not yet in the map). Still narrow-waist: no free (x,z). A human operator approves it into geometry/conditions or discards it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "server", "map", "road", "seg", "along", "cond", "observedY"],
+  "properties": {
+    "v": { "const": 1 },
+    "server": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "map": { "type": "string", "pattern": "^sha256:[0-9a-f]{16}$" },
+    "road": { "type": "integer", "minimum": 0 },
+    "seg": { "type": "integer", "minimum": 0 },
+    "along": { "type": "integer", "minimum": 0 },
+    "cond": {
+      "type": "string",
+      "enum": ["CLEAR", "HOLE", "LAVA", "OBSTRUCTION_FULL", "OBSTRUCTION_PARTIAL", "COBWEB", "WATER", "GRAVEL", "UNBUILT", "PRESENCE"]
+    },
+    "observedY": { "type": "integer", "minimum": -64, "maximum": 320, "description": "the Y actually observed (why it missed the strict y120 gate)" },
+    "note": { "type": "string", "maxLength": 280, "description": "optional free-text context for the human reviewer" }
+  }
+}
