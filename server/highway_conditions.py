@@ -29,6 +29,7 @@ import queue
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -194,7 +195,7 @@ class Store:
     def __init__(self, geometry_dir, db_path=":memory:", bucket=DEFAULT_BUCKET,
                  k_anon=4, k_tier_b=2, ttl=3600, clear_factor=2, reopen_window=3600,
                  salt=None, clock=time.time, max_travel_speed=MAX_TRAVEL_SPEED_DEFAULT,
-                 on_event=None, presence_oracles=None):
+                 on_event=None, presence_oracles=None, identity_salt=None):
         self.bucket = bucket
         self.k_anon = k_anon      # Tier C (anonymous, IP-hash) corroboration threshold
         self.k_tier_b = k_tier_b  # Tier B (Discord-verified identity) threshold -- lower than
@@ -216,6 +217,17 @@ class Store:
         self.presence_oracles = presence_oracles or {}
         self.clock = clock
         self.salt = salt or secrets.token_hex(16)
+        # Deliberately a SEPARATE salt from self.salt, and deliberately meant to be
+        # persisted across restarts (unlike self.salt, which rotating every restart
+        # is a real privacy property -- see _source_hash -- not a bug). identity_hash
+        # is the primary key of the `identities` table (trust score, last-known
+        # position for travel-plausibility); if this salt regenerates on every
+        # restart, every existing row becomes permanently unreachable (the SAME
+        # real-world source_key now hashes to a different value), which silently
+        # resets the whole reputation layer to baseline on every restart even
+        # though the rows are still sitting right there in a persistent --db file.
+        # See build_app's --identity-salt/ARD_IDENTITY_SALT.
+        self.identity_salt = identity_salt or secrets.token_hex(16)
         self.networks = {}
         self.map_hashes = {}
         self._lock = threading.RLock()
@@ -368,12 +380,14 @@ class Store:
 
     # ---- reputation layer (see the module-level note above _TIER_RANK) ----
     def _identity_hash(self, server, source_key):
-        # Deliberately a DIFFERENT hash space from _source_hash (no cond/seg/along in
-        # the input, and a distinct literal tag) -- this hash must be the same across
-        # different locations for the same identity (that's the whole point), so it
-        # must never collide with or be derivable from any per-condition-key source
-        # hash, and vice versa.
-        key = f"{self.salt}|identity|{server}|{source_key or ''}"
+        # Deliberately a DIFFERENT hash space from _source_hash -- a distinct salt
+        # (self.identity_salt, not self.salt), a distinct literal tag, no
+        # cond/seg/along in the input. This hash must be the same across different
+        # locations for the same identity (that's the whole point) AND across
+        # restarts (see identity_salt's own comment above), so it must never
+        # collide with or be derivable from any per-condition-key source hash, and
+        # vice versa.
+        key = f"{self.identity_salt}|identity|{server}|{source_key or ''}"
         return hashlib.sha256(key.encode()).hexdigest()[:16]
 
     def _get_trust(self, identity_hash):
@@ -1756,6 +1770,8 @@ def apply_env_secrets(args, environ=None):
     if getattr(args, "presence_check", None) is None:
         env_val = environ.get("ARD_PRESENCE_CHECK")
         args.presence_check = _parse_bool_env(env_val) if env_val is not None else True
+    if not getattr(args, "identity_salt", None):
+        args.identity_salt = environ.get("ARD_IDENTITY_SALT") or None
     return args
 
 
@@ -1794,12 +1810,26 @@ def _default_presence_oracles(args):
     return {"2b2t.org": presence.TwoBTwoTVCPresence()}
 
 
+def _resolve_identity_salt(args):
+    salt = getattr(args, "identity_salt", None)
+    if salt:
+        return salt
+    # No silent, permanent reset: generate one for this run and say so loudly --
+    # same posture as every other secret in this project (never guess quietly).
+    generated = secrets.token_hex(16)
+    print(f"WARNING: no --identity-salt/ARD_IDENTITY_SALT set -- generated one for THIS "
+          f"RUN ONLY. Trust scores and travel-plausibility state will reset on the next "
+          f"restart. To persist them, set ARD_IDENTITY_SALT={generated}", file=sys.stderr)
+    return generated
+
+
 def build_app(args):
     presence_oracles = _default_presence_oracles(args)
     store = Store(args.geometry, db_path=args.db, bucket=args.bucket,
                   k_anon=args.k_anon, k_tier_b=args.k_tier_b, ttl=args.ttl,
                   clear_factor=args.clear_factor, reopen_window=args.reopen_window,
-                  max_travel_speed=args.max_travel_speed, presence_oracles=presence_oracles)
+                  max_travel_speed=args.max_travel_speed, presence_oracles=presence_oracles,
+                  identity_salt=_resolve_identity_salt(args))
     notifier = notify.Notifier(url=getattr(args, "ntfy_url", None),
                                 token=getattr(args, "ntfy_token", None))
     if notifier.enabled:
@@ -1839,6 +1869,12 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8788)
     ap.add_argument("--db", default=":memory:")
     ap.add_argument("--bucket", type=int, default=DEFAULT_BUCKET)
+    ap.add_argument("--identity-salt",
+                     help="persistent salt for the reputation layer's identity_hash "
+                          "(trust score, travel-plausibility state) -- generate ONCE with "
+                          "`openssl rand -hex 16` and keep it stable across restarts, or "
+                          "trust/travel-plausibility state resets every restart -- or set "
+                          "ARD_IDENTITY_SALT")
     ap.add_argument("--k-anon", type=int, default=4,
                      help="Tier C (anonymous, IP-hash) corroboration threshold (K_TIER_C_NEW)")
     ap.add_argument("--k-tier-b", type=int, default=2,

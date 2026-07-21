@@ -218,12 +218,26 @@ Both travel-plausibility and per-identity trust weighting need the same new capa
 "this is the same pseudonymous identity" apart across *different* locations over time. That's
 deliberately impossible for the ordinary per-report `source_key` hash (§6.1 above — scoped per
 condition key precisely so it *can't* be cross-linked). This layer introduces a **second,
-separate hash space** — `hash(salt | "identity" | server | source_key)`, recomputed live per
-request exactly like every other use of `source_key` in this project, never persisted raw — used
-only to look up a small per-identity record: a trust score and the identity's last claimed
-`(road, seg, along)` + timestamp. This is an explicit, narrower weakening of the
+separate hash space** — `hash(identity_salt | "identity" | server | source_key)`, recomputed
+live per request exactly like every other use of `source_key` in this project, never persisted
+raw — used only to look up a small per-identity record: a trust score and the identity's last
+claimed `(road, seg, along)` + timestamp. This is an explicit, narrower weakening of the
 "sources can't be correlated across different condition keys" property than existed before —
 the tradeoff accepted for this pragmatic version instead of the full cryptographic one.
+
+**`identity_salt` is a separate salt from the per-condition source-hash salt (`Store.salt`), and
+deliberately persisted across restarts (0.1.5, `--identity-salt`/`ARD_IDENTITY_SALT`)** — a real
+bug found and fixed: before this, `Store.__init__` generated ONE random salt used for both hash
+spaces, regenerated fresh every process start. The per-condition source-hash rotating every
+restart is an intentional privacy property (limits how long any one salt's exposure window is) —
+but the SAME rotation silently broke the reputation layer, since `identity_hash` is the primary
+key of the `identities` table (trust score, travel-plausibility's last-known position): a changed
+salt means every existing row becomes permanently unreachable, so the whole reputation layer
+quietly reset to baseline on every restart even though the rows themselves were sitting right
+there in a persistent `--db` file the whole time. Fixed by splitting the two salts; only
+`identity_salt` needs persisting (generate once with `openssl rand -hex 16`, keep it in the env
+file). If unconfigured, the service still starts (generates one for that run only) but prints a
+loud warning — the same "never guess quietly" posture every other secret in this project follows.
 
 **Travel-plausibility.** On every Tier B/C report, the server re-derives the claimed position's
 real `(x, z)` (already does this for the wire-format narrow waist, §1) and compares it against

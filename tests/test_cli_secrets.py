@@ -2,15 +2,17 @@
 with -- never overriding -- whatever CLI flags already supplied. Keeps secrets out
 of `ps aux` on shared boxes without breaking the CLI-flag path local/dev runs use."""
 import argparse
+import io
 import pathlib
 import sys
 import unittest
+from contextlib import redirect_stderr
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "server"))
 
 import trust  # noqa: E402
-from highway_conditions import apply_env_secrets, _seed_discord_admins  # noqa: E402
+from highway_conditions import apply_env_secrets, _seed_discord_admins, _resolve_identity_salt  # noqa: E402
 
 
 def _args(**overrides):
@@ -114,12 +116,50 @@ class ApplyEnvSecretsTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             apply_env_secrets(_args(), environ={"ARD_REQUIRE_OWNERSHIP_PROOF": "sometimes"})
 
+    def test_identity_salt_env_fills_in_when_cli_absent(self):
+        args = apply_env_secrets(_args(), environ={"ARD_IDENTITY_SALT": "persisted-salt"})
+        self.assertEqual(args.identity_salt, "persisted-salt")
+
+    def test_identity_salt_cli_wins_over_env(self):
+        args = apply_env_secrets(_args(identity_salt="cli-salt"),
+                                  environ={"ARD_IDENTITY_SALT": "env-salt"})
+        self.assertEqual(args.identity_salt, "cli-salt")
+
+    def test_identity_salt_none_with_no_cli_or_env(self):
+        args = apply_env_secrets(_args(), environ={})
+        self.assertIsNone(args.identity_salt)
+
     def test_ntfy_cli_wins_over_env(self):
         args = apply_env_secrets(_args(ntfy_url="https://cli.test/t", ntfy_token="cli-tk"),
                                   environ={"ARD_NTFY_URL": "https://env.test/t",
                                             "ARD_NTFY_TOKEN": "env-tk"})
         self.assertEqual(args.ntfy_url, "https://cli.test/t")
         self.assertEqual(args.ntfy_token, "cli-tk")
+
+
+class ResolveIdentitySaltTests(unittest.TestCase):
+    def test_configured_salt_is_used_as_is(self):
+        args = _args(identity_salt="my-persisted-salt")
+        self.assertEqual(_resolve_identity_salt(args), "my-persisted-salt")
+
+    def test_unconfigured_salt_generates_one_and_warns(self):
+        args = _args()  # identity_salt absent entirely
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            salt = _resolve_identity_salt(args)
+        self.assertTrue(salt)
+        warning = stderr.getvalue()
+        self.assertIn("WARNING", warning)
+        self.assertIn("ARD_IDENTITY_SALT", warning)
+        self.assertIn(salt, warning, "the generated value must be shown so an operator can copy it")
+
+    def test_generated_salt_differs_each_call(self):
+        # Not persisted anywhere by itself -- every unconfigured call is a fresh
+        # warning-worthy generation, never silently reused.
+        with redirect_stderr(io.StringIO()):
+            a = _resolve_identity_salt(_args())
+            b = _resolve_identity_salt(_args())
+        self.assertNotEqual(a, b)
 
 
 class SeedDiscordAdminsTests(unittest.TestCase):

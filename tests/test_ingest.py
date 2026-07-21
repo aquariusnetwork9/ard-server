@@ -582,5 +582,88 @@ class PresenceCheckTests(unittest.TestCase):
 
 
 
+class IdentitySaltPersistenceTests(unittest.TestCase):
+    """A5: identity_hash uses its own salt, separate from the per-condition
+    source-hash salt, and MUST be stable across restarts for the reputation
+    layer to mean anything -- see the module-level comment on Store.__init__."""
+
+    def setUp(self):
+        self.clock = Clock()
+
+    def store(self, salt, identity_salt):
+        return Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock,
+                     salt=salt, identity_salt=identity_salt)
+
+    def test_identity_hash_ignores_the_source_hash_salt(self):
+        a = self.store(salt="source-salt-A", identity_salt="identity-salt-X")
+        b = self.store(salt="source-salt-B", identity_salt="identity-salt-X")
+        self.assertEqual(a._identity_hash(SERVER, "discord-1"), b._identity_hash(SERVER, "discord-1"),
+                          "changing only the source-hash salt must not affect identity_hash")
+
+    def test_identity_hash_changes_with_its_own_salt(self):
+        a = self.store(salt="source-salt-A", identity_salt="identity-salt-X")
+        b = self.store(salt="source-salt-A", identity_salt="identity-salt-Y")
+        self.assertNotEqual(a._identity_hash(SERVER, "discord-1"), b._identity_hash(SERVER, "discord-1"))
+
+    def test_source_hash_still_uses_its_own_salt_unaffected_by_identity_salt(self):
+        net = self.store(salt="source-salt-A", identity_salt="X").networks[SERVER]
+        canon = net["_canon"][0]
+        a = self.store(salt="source-salt-A", identity_salt="identity-salt-X")
+        b = self.store(salt="source-salt-A", identity_salt="identity-salt-Y")
+        self.assertEqual(a._source_hash(SERVER, canon, 0, 0, "HOLE", "10.0.0.1"),
+                          b._source_hash(SERVER, canon, 0, 0, "HOLE", "10.0.0.1"),
+                          "changing only identity_salt must not affect the source hash")
+
+    def test_trust_score_survives_a_simulated_restart(self):
+        # Same identity_salt + same persistent db_path across two Store instances
+        # models a real restart (a fresh process, the same on-disk state).
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            db_path = str(pathlib.Path(d) / "conditions.db")
+            store1 = Store(str(GEO_DIR), db_path=db_path, k_anon=2, ttl=1000,
+                           clock=self.clock, salt="rotating-1", identity_salt="stable-salt")
+            ih = store1._identity_hash(SERVER, "discord-1")
+            store1._adjust_trust(ih, -TRUST_PENALTY, self.clock.t)
+            store1.db.commit()  # _adjust_trust relies on its caller to commit (ingest() does)
+            self.assertAlmostEqual(store1._get_trust(ih), TRUST_BASELINE - TRUST_PENALTY)
+            store1.db.close()
+
+            # "Restart": a fresh Store, source-hash salt rotated (as it always
+            # does), identity_salt held stable.
+            store2 = Store(str(GEO_DIR), db_path=db_path, k_anon=2, ttl=1000,
+                           clock=self.clock, salt="rotating-2", identity_salt="stable-salt")
+            try:
+                ih2 = store2._identity_hash(SERVER, "discord-1")
+                self.assertEqual(ih, ih2, "same identity_salt -> same identity_hash across restart")
+                self.assertAlmostEqual(store2._get_trust(ih2), TRUST_BASELINE - TRUST_PENALTY,
+                                       msg="trust score must survive the restart")
+            finally:
+                store2.db.close()
+
+    def test_trust_score_does_not_survive_if_identity_salt_also_changes(self):
+        # The bug this fixes: build_app previously had no way to persist this at
+        # all, so every restart silently reset every trust score to baseline.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            db_path = str(pathlib.Path(d) / "conditions.db")
+            store1 = Store(str(GEO_DIR), db_path=db_path, k_anon=2, ttl=1000,
+                           clock=self.clock, identity_salt="salt-before-restart")
+            ih = store1._identity_hash(SERVER, "discord-1")
+            store1._adjust_trust(ih, -TRUST_PENALTY, self.clock.t)
+            store1.db.commit()
+            store1.db.close()
+
+            store2 = Store(str(GEO_DIR), db_path=db_path, k_anon=2, ttl=1000,
+                           clock=self.clock, identity_salt="salt-after-restart")
+            try:
+                ih2 = store2._identity_hash(SERVER, "discord-1")
+                self.assertNotEqual(ih, ih2)
+                self.assertAlmostEqual(store2._get_trust(ih2), TRUST_BASELINE,
+                                       msg="a changed identity_salt orphans the old row -> baseline")
+            finally:
+                store2.db.close()
+
+
+
 if __name__ == "__main__":
     unittest.main()
