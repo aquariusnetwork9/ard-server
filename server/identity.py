@@ -62,10 +62,16 @@ def _format_code(raw_hex):
 class LinkStore:
     def __init__(self, db_path=":memory:", link_code_ttl=DEFAULT_LINK_CODE_TTL,
                  max_linked_uids=DEFAULT_MAX_LINKED_UIDS, clock=time.time,
-                 min_discord_age=DEFAULT_MIN_DISCORD_AGE):
+                 min_discord_age=DEFAULT_MIN_DISCORD_AGE,
+                 require_ownership_proof=True):
         self.link_code_ttl = link_code_ttl
         self.max_linked_uids = max_linked_uids
         self.min_discord_age = min_discord_age
+        # The "real fix" for A4 (PROTOCOL.md §6.1): a self-claimed mc_uid is no
+        # longer enough on its own -- complete_link also requires verify_ownership
+        # to have passed first. Only ever False in tests/local dev without live
+        # Mojang connectivity.
+        self.require_ownership_proof = require_ownership_proof
         self.clock = clock
         self._lock = threading.RLock()
         self.db = sqlite3.connect(db_path, check_same_thread=False)
@@ -75,7 +81,8 @@ class LinkStore:
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS pending_links(
           code TEXT PRIMARY KEY, mc_uid TEXT NOT NULL, server TEXT NOT NULL DEFAULT '',
-          created_at REAL NOT NULL, used INTEGER NOT NULL DEFAULT 0
+          created_at REAL NOT NULL, used INTEGER NOT NULL DEFAULT 0,
+          verify_server_id TEXT, verified INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS identities(
           discord_id TEXT NOT NULL, server TEXT NOT NULL, created_at REAL NOT NULL,
@@ -103,6 +110,10 @@ class LinkStore:
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(pending_links)").fetchall()}
         if "server" not in cols:
             self.db.execute("ALTER TABLE pending_links ADD COLUMN server TEXT NOT NULL DEFAULT '2b2t.org'")
+            self.db.commit()
+        if "verify_server_id" not in cols:
+            self.db.execute("ALTER TABLE pending_links ADD COLUMN verify_server_id TEXT")
+            self.db.execute("ALTER TABLE pending_links ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
             self.db.commit()
 
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(identities)").fetchall()}
@@ -149,13 +160,54 @@ class LinkStore:
         if not server:
             raise ValueError("server required")
         code = _format_code(secrets.token_hex(4))
+        # A random nonce the producer uses for its own Mojang session/minecraft/join
+        # call (see verify_ownership below) -- separate from `code`, which is the
+        # human-facing device code, so the two never leak into each other's flow.
+        verify_server_id = secrets.token_hex(16)
         now = self.clock()
         with self._lock:
             self.db.execute(
-                "INSERT INTO pending_links(code,mc_uid,server,created_at,used) VALUES(?,?,?,?,0)",
-                (code, mc_uid, server, now))
+                "INSERT INTO pending_links(code,mc_uid,server,created_at,used,verify_server_id)"
+                " VALUES(?,?,?,?,0,?)",
+                (code, mc_uid, server, now, verify_server_id))
             self.db.commit()
         return code
+
+    def verify_server_id_for(self, code):
+        """The Mojang join-proof nonce for a still-pending code, or None if the
+        code is unknown/already used. Read-only, doesn't touch `verified` --
+        lets /link/init's response include it without changing init_link's
+        existing (widely tested) return shape."""
+        row = self.db.execute(
+            "SELECT verify_server_id FROM pending_links WHERE code=? AND used=0", (code,)).fetchone()
+        return row[0] if row else None
+
+    # ---- step 1.5: producer proves it holds a live Mojang session for mc_uid ----
+    def verify_ownership(self, code, mojang_verify):
+        """Consumes nothing (the code is still needed for /link/complete) -- just
+        marks the pending link ownership-verified once `mojang_verify(mc_uid,
+        verify_server_id)` confirms the producer's own prior `session/minecraft/join`
+        call really was made by that account. `mojang_verify` is injectable so tests
+        never hit the real Mojang API (same pattern as discord_verify elsewhere in
+        this project). Raises ValueError on an unknown/used/expired code or a failed
+        proof."""
+        now = self.clock()
+        with self._lock:
+            row = self.db.execute(
+                "SELECT mc_uid, created_at, used, verify_server_id FROM pending_links WHERE code=?",
+                (code,)).fetchone()
+            if row is None:
+                raise ValueError("unknown link code")
+            mc_uid, created_at, used, verify_server_id = row
+            if used:
+                raise ValueError("link code already used")
+            if now - created_at > self.link_code_ttl:
+                raise ValueError("link code expired")
+            if not mojang_verify(mc_uid, verify_server_id):
+                raise ValueError("Mojang ownership proof failed -- the account did not "
+                                  "join with the expected server id")
+            self.db.execute("UPDATE pending_links SET verified=1 WHERE code=?", (code,))
+            self.db.commit()
 
     # ---- read-only peek: which server a pending code was init'd for ----
     def peek_pending_server(self, code):
@@ -183,20 +235,24 @@ class LinkStore:
         mc_uid, linked to discord_id, ON THE SERVER RECORDED AT /link/init TIME
         (not re-supplied here -- the browser-side completion step never needs to
         know or choose it). Returns (token_id, token). Raises ValueError on an
-        unknown/expired/already-used code, a suspended identity, or hitting
+        unknown/expired/already-used code, a not-yet-ownership-verified code (when
+        require_ownership_proof is on), a suspended identity, or hitting
         max_linked_uids for that server."""
         now = self.clock()
         with self._lock:
             row = self.db.execute(
-                "SELECT mc_uid, server, created_at, used FROM pending_links WHERE code=?",
+                "SELECT mc_uid, server, created_at, used, verified FROM pending_links WHERE code=?",
                 (code,)).fetchone()
             if row is None:
                 raise ValueError("unknown link code")
-            mc_uid, server, created_at, used = row
+            mc_uid, server, created_at, used, verified = row
             if used:
                 raise ValueError("link code already used")
             if now - created_at > self.link_code_ttl:
                 raise ValueError("link code expired")
+            if self.require_ownership_proof and not verified:
+                raise ValueError("Mojang ownership not verified yet -- call "
+                                  "/link/verify-ownership first")
 
             if self.min_discord_age > 0:
                 # Age comes from the snowflake itself; an id that doesn't parse as
@@ -259,6 +315,22 @@ class LinkStore:
         with self._lock:
             row = self.db.execute(
                 "SELECT lu.discord_id FROM linked_uids lu JOIN identities i"
+                " ON i.discord_id = lu.discord_id AND i.server = lu.server"
+                " WHERE lu.token_hash=? AND lu.server=? AND lu.revoked=0 AND i.suspended=0",
+                (self.hash_token(token), server)).fetchone()
+        return row[0] if row else None
+
+    def mc_uid_for(self, token, server):
+        """The specific mc_uid a live Tier B token is linked to on this server, or
+        None. A given token is minted for exactly one (mc_uid, server) pair, unlike
+        discord_identity_for's identity-level resolution -- used for per-account
+        checks (e.g. presence verification) that discord_id alone can't answer,
+        since one identity may have several linked UIDs."""
+        if not token or not server:
+            return None
+        with self._lock:
+            row = self.db.execute(
+                "SELECT lu.mc_uid FROM linked_uids lu JOIN identities i"
                 " ON i.discord_id = lu.discord_id AND i.server = lu.server"
                 " WHERE lu.token_hash=? AND lu.server=? AND lu.revoked=0 AND i.suspended=0",
                 (self.hash_token(token), server)).fetchone()
@@ -340,3 +412,51 @@ def discord_exchange(client_id, client_secret, redirect_uri, discord_code, timeo
     if not discord_id:
         raise DiscordOAuthError("no id in Discord's user profile response")
     return discord_id
+
+
+class MojangVerifyError(Exception):
+    pass
+
+
+def mojang_verify_join(mc_uid, server_id, timeout=10):
+    """Real Mojang session-server ownership proof, pure stdlib. The producer
+    (plugin-aquarius/client-fabric) makes its OWN `session/minecraft/join` call
+    directly to Mojang using its live session's access token, `selectedProfile`
+    set to mc_uid, and `serverId` set to this pending link's verify_server_id --
+    that call never touches ARD at all, it's between the producer and Mojang. This
+    function is the other half: given only mc_uid and that same serverId, ask
+    Mojang's hasJoined whether such a join really just happened.
+
+    hasJoined is keyed by USERNAME, not uuid (a legacy Yggdrasil quirk), so this
+    first resolves mc_uid's current username via the session-server profile
+    endpoint, then calls hasJoined with that username + server_id. Returns True
+    only if Mojang's response profile id matches mc_uid (belt-and-suspenders --
+    should always hold, since the username was itself resolved from mc_uid a
+    moment earlier). False (not True) on ANY negative signal, network error, or
+    malformed response -- this function's job is a strict yes/no, never a crash
+    that could look like a bypass."""
+    try:
+        profile_req = urllib.request.Request(
+            f"https://sessionserver.mojang.com/session/minecraft/profile/{mc_uid}",
+            headers={"User-Agent": _USER_AGENT})
+        with urllib.request.urlopen(profile_req, timeout=timeout) as resp:
+            profile = json.loads(resp.read())
+        username = profile.get("name")
+        if not username:
+            return False
+
+        params = urllib.parse.urlencode({"username": username, "serverId": server_id})
+        has_joined_req = urllib.request.Request(
+            f"https://sessionserver.mojang.com/session/minecraft/hasJoined?{params}",
+            headers={"User-Agent": _USER_AGENT})
+        with urllib.request.urlopen(has_joined_req, timeout=timeout) as resp:
+            if resp.status == 204:  # no body -- Mojang's "did not join" response
+                return False
+            joined = json.loads(resp.read())
+        return _normalize_uuid(joined.get("id")) == _normalize_uuid(mc_uid)
+    except (urllib.error.URLError, ValueError, TypeError):
+        return False
+
+
+def _normalize_uuid(u):
+    return (u or "").replace("-", "").lower()

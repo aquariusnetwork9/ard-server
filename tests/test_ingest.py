@@ -501,5 +501,86 @@ class StoreEventTests(unittest.TestCase):
         self.assertTrue(v["published"], "a raising event callback must not fail the ingest")
 
 
+class FakeOracle:
+    def __init__(self, present_uuids=None, always_none=False):
+        self.present_uuids = present_uuids or set()
+        self.always_none = always_none
+        self.calls = []
+
+    def is_present(self, mc_uid):
+        self.calls.append(mc_uid)
+        if self.always_none:
+            return None
+        return mc_uid in self.present_uuids
+
+
+class PresenceCheckTests(unittest.TestCase):
+    """Tier B reports get checked against a per-server presence oracle when one
+    is configured (A4's second rung). Excludes from corroboration + trust
+    penalty on a confirmed-absent verdict; a None (unknown/unreachable) verdict
+    must cost nothing."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.oracle = FakeOracle(present_uuids={"mc-uid-present"})
+        self.store = Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt",
+                           presence_oracles={SERVER: self.oracle})
+        self.net = self.store.networks[SERVER]
+        self.map = self.store.map_hashes[SERVER]
+
+    def report(self, x, z, cond="HOLE"):
+        r = reference_client.build_report(x, 120, z, "NETHER", self.net, self.map, SERVER,
+                                          cond=cond, now=self.clock.t)
+        self.assertIsNotNone(r)
+        return r
+
+    def test_present_reporter_corroborates_normally(self):
+        v = self.store.ingest(self.report(3000, 0), "discord-1", "B", mc_uid="mc-uid-present")
+        self.assertEqual(v["distinctSources"], 1)
+
+    def test_absent_reporter_excluded_from_corroboration(self):
+        v = self.store.ingest(self.report(3100, 0), "discord-1", "B", mc_uid="mc-uid-absent")
+        self.assertEqual(v["distinctSources"], 0,
+                          "a confirmed-absent reporter's report must not corroborate")
+
+    def test_absent_reporter_takes_a_trust_penalty(self):
+        identity_hash = self.store._identity_hash(SERVER, "discord-1")
+        self.store.ingest(self.report(3200, 0), "discord-1", "B", mc_uid="mc-uid-absent")
+        self.assertAlmostEqual(self.store._get_trust(identity_hash), TRUST_BASELINE - TRUST_PENALTY)
+
+    def test_unknown_oracle_verdict_costs_nothing(self):
+        oracle = FakeOracle(always_none=True)
+        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt2",
+                     presence_oracles={SERVER: oracle})
+        net, mh = store.networks[SERVER], store.map_hashes[SERVER]
+        r = reference_client.build_report(3300, 120, 0, "NETHER", net, mh, SERVER,
+                                          cond="HOLE", now=self.clock.t)
+        identity_hash = store._identity_hash(SERVER, "discord-1")
+        v = store.ingest(r, "discord-1", "B", mc_uid="some-uid")
+        self.assertEqual(v["distinctSources"], 1, "an unreachable oracle must not exclude the report")
+        self.assertAlmostEqual(store._get_trust(identity_hash), TRUST_BASELINE, "and must not penalize")
+
+    def test_no_oracle_configured_for_server_is_a_no_op(self):
+        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt3")
+        net, mh = store.networks[SERVER], store.map_hashes[SERVER]
+        r = reference_client.build_report(3400, 120, 0, "NETHER", net, mh, SERVER,
+                                          cond="HOLE", now=self.clock.t)
+        v = store.ingest(r, "discord-1", "B", mc_uid="whatever-uid")
+        self.assertEqual(v["distinctSources"], 1)
+
+    def test_no_mc_uid_is_a_no_op_even_with_an_oracle_configured(self):
+        # Shouldn't happen in practice (Tier B always has a linked mc_uid), but
+        # the check must degrade gracefully rather than crash on missing data.
+        v = self.store.ingest(self.report(3500, 0), "discord-1", "B", mc_uid=None)
+        self.assertEqual(v["distinctSources"], 1)
+        self.assertEqual(self.oracle.calls, [], "no mc_uid means no oracle call at all")
+
+    def test_tier_c_is_never_checked_against_presence(self):
+        # Tier C has no linked mc_uid at all -- presence-check is Tier B only.
+        v = self.store.ingest(self.report(3600, 0), "10.0.0.1", "C", mc_uid="mc-uid-absent")
+        self.assertEqual(v["distinctSources"], 1, "mc_uid is meaningless for Tier C; must be ignored")
+
+
+
 if __name__ == "__main__":
     unittest.main()

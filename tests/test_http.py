@@ -102,7 +102,7 @@ class HttpTests(unittest.TestCase):
         registry.issue("fleet-bot-1", "test-owner", trust.SCOPE_FULL, SERVER, token=FULL_TOKEN)
         registry.issue("highway-crew-1", "test-owner", trust.SCOPE_MAINTAINER, SERVER, token=MAINTAINER_TOKEN)
         registry.issue("mod-1", "test-owner", trust.SCOPE_MODERATOR, SERVER, token=MODERATOR_TOKEN)
-        links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8)
+        links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8, require_ownership_proof=False)
         sess = sessions.SessionStore()
         # Dashboard access granted directly to a Discord identity (no bearer
         # token) -- what /admin/login resolves into a session for.
@@ -528,7 +528,7 @@ class AdminDashboardTests(unittest.TestCase):
         registry = trust.Registry()
         registry.grant_to_discord("discord-admin-1", trust.SCOPE_ADMIN, SERVER, "test-owner")
         registry.grant_to_discord("discord-mod-1", trust.SCOPE_MODERATOR, SERVER, "test-owner")
-        links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8)
+        links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8, require_ownership_proof=False)
         sess = sessions.SessionStore()
         auth = Auth(registry, links=links, owner_hashes={Auth.hash_token(OWNER_TOKEN)}, sessions=sess)
         cls.registry = registry
@@ -674,7 +674,7 @@ class BotLinkTests(unittest.TestCase):
     def setUpClass(cls):
         store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-bot")
         registry = trust.Registry()
-        links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8)
+        links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8, require_ownership_proof=False)
         auth = Auth(registry, links=links, owner_hashes={Auth.hash_token(OWNER_TOKEN)},
                     bot_hashes={Auth.hash_token(BOT_TOKEN)})
         cls.links = links
@@ -746,6 +746,94 @@ class BotLinkTests(unittest.TestCase):
         status, _ = req("POST", self.url("/link/bot-complete"), token=BOT_TOKEN, body={})
         self.assertEqual(status, 400)
 
+
+class OwnershipProofHttpTests(unittest.TestCase):
+    """The Mojang ownership-proof gate end to end at the HTTP layer, with
+    require_ownership_proof at its real default (True) -- every other HTTP test
+    class disables it to test unrelated things. A fake mojang_verify stands in
+    for the real network call (mojang_verify_join itself is unit-tested
+    directly in test_identity.py)."""
+
+    @classmethod
+    def setUpClass(cls):
+        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-ownership")
+        registry = trust.Registry()
+        cls.links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8)
+        auth = Auth(registry, links=cls.links, bot_hashes={Auth.hash_token(BOT_TOKEN)})
+        cls.verify_result = True
+
+        def fake_mojang_verify(mc_uid, server_id):
+            return cls.verify_result
+
+        cls.app = App(store, auth, discord_verify=fake_discord_verify,
+                      mojang_verify=fake_mojang_verify)
+        cls.srv = Server(("127.0.0.1", 0), cls.app)
+        cls.port = cls.srv.server_address[1]
+        cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.t.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def test_link_init_returns_a_verify_server_id(self):
+        status, body = req("POST", self.url("/link/init"),
+                            body={"mcUid": "mc-uid-own-1", "server": SERVER})
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("verifyServerId"))
+
+    def test_complete_before_verifying_is_rejected(self):
+        _, init_body = req("POST", self.url("/link/init"),
+                            body={"mcUid": "mc-uid-own-2", "server": SERVER})
+        status, body = req("POST", self.url("/link/complete"),
+                            body={"linkCode": init_body["code"], "discordCode": "good-code-1"})
+        self.assertEqual(status, 400)
+        self.assertIn("not verified", body["error"])
+
+    def test_verify_then_complete_succeeds(self):
+        _, init_body = req("POST", self.url("/link/init"),
+                            body={"mcUid": "mc-uid-own-3", "server": SERVER})
+        code = init_body["code"]
+        type(self).verify_result = True
+        status, verify_body = req("POST", self.url("/link/verify-ownership"), body={"linkCode": code})
+        self.assertEqual(status, 200)
+        self.assertTrue(verify_body["verified"])
+        status, body = req("POST", self.url("/link/complete"),
+                            body={"linkCode": code, "discordCode": "good-code-1"})
+        self.assertEqual(status, 200)
+        self.assertIn("token", body)
+
+    def test_failed_mojang_proof_is_rejected(self):
+        _, init_body = req("POST", self.url("/link/init"),
+                            body={"mcUid": "mc-uid-own-4", "server": SERVER})
+        type(self).verify_result = False
+        status, body = req("POST", self.url("/link/verify-ownership"),
+                            body={"linkCode": init_body["code"]})
+        self.assertEqual(status, 400)
+        type(self).verify_result = True  # restore for later tests in this class
+
+    def test_verify_ownership_unknown_code(self):
+        status, body = req("POST", self.url("/link/verify-ownership"), body={"linkCode": "DEAD-BEEF"})
+        self.assertEqual(status, 400)
+
+    def test_verify_ownership_missing_field(self):
+        status, _ = req("POST", self.url("/link/verify-ownership"), body={})
+        self.assertEqual(status, 400)
+
+    def test_bot_complete_also_requires_verification(self):
+        # Both completion paths (website OAuth and bot-complete) share
+        # complete_link, so the gate applies identically to each.
+        _, init_body = req("POST", self.url("/link/init"),
+                            body={"mcUid": "mc-uid-own-5", "server": SERVER})
+        status, body = req("POST", self.url("/link/bot-complete"), token=BOT_TOKEN,
+                            body={"linkCode": init_body["code"], "discordId": "discord-own-bot-1"})
+        self.assertEqual(status, 400)
+        self.assertIn("not verified", body["error"])
+
+
 class BotLinkRateLimitTests(unittest.TestCase):
     """Isolated in its own class/server (own limiter instance) so hammering this
     budget can't leak 429s into BotLinkTests' other methods -- unittest runs
@@ -756,7 +844,7 @@ class BotLinkRateLimitTests(unittest.TestCase):
     def setUpClass(cls):
         store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-bot-rl")
         registry = trust.Registry()
-        links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8)
+        links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8, require_ownership_proof=False)
         auth = Auth(registry, links=links, bot_hashes={Auth.hash_token(BOT_TOKEN)})
         cls.links = links
         cls.app = App(store, auth)

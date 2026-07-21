@@ -38,6 +38,7 @@ from urllib.parse import urlparse, parse_qs
 import geometry
 import identity
 import notify
+import presence
 import sessions as sessions_mod
 import trust
 from geometry import (
@@ -193,7 +194,7 @@ class Store:
     def __init__(self, geometry_dir, db_path=":memory:", bucket=DEFAULT_BUCKET,
                  k_anon=4, k_tier_b=2, ttl=3600, clear_factor=2, reopen_window=3600,
                  salt=None, clock=time.time, max_travel_speed=MAX_TRAVEL_SPEED_DEFAULT,
-                 on_event=None):
+                 on_event=None, presence_oracles=None):
         self.bucket = bucket
         self.k_anon = k_anon      # Tier C (anonymous, IP-hash) corroboration threshold
         self.k_tier_b = k_tier_b  # Tier B (Discord-verified identity) threshold -- lower than
@@ -209,6 +210,10 @@ class Store:
         # (reopen flagged, an identity hitting the trust floor). Must never raise
         # into store logic -- see _emit.
         self.on_event = on_event
+        # {server: object with .is_present(mc_uid) -> True/False/None} -- optional,
+        # per-server third-party presence sources (see presence.py). Only Tier B
+        # reports carry an mc_uid to check against.
+        self.presence_oracles = presence_oracles or {}
         self.clock = clock
         self.salt = salt or secrets.token_hex(16)
         self.networks = {}
@@ -433,15 +438,28 @@ class Store:
         weight = self._corroboration_weight(cond_id, now)
         return last_seen if weight >= self._corroboration_threshold(tier) * self.clear_factor else None
 
+    def _check_presence(self, server, mc_uid):
+        """True/False/None (unknown/unreachable) -- whether mc_uid is confirmed
+        online on server via a configured third-party presence oracle. None (not
+        False) when no oracle is configured for this server, or the oracle itself
+        couldn't answer -- a third party's outage must never itself become a way
+        to suppress real reporting, so an unknown answer never costs anything."""
+        oracle = self.presence_oracles.get(server)
+        if oracle is None:
+            return None
+        return oracle.is_present(mc_uid)
+
     # ---- ingest ----
-    def ingest(self, report, source_key, tier):
+    def ingest(self, report, source_key, tier, mc_uid=None):
         """report must already have passed validate_report(). tier is 'A', 'M', 'B',
         or 'C' (see App._report for how a presented token maps to a tier). source_key
         is whatever identifies the reporter for corroboration purposes -- the raw
         client IP for Tier C, a resolved discord_id for Tier B, a per-holder token id
         for A/M (matters for A: its CLEARs go through corroboration and the
         non-overlap rule, so its source identity has to be stable per holder, not a
-        shared fleet IP).
+        shared fleet IP). mc_uid, when known (Tier B only -- a specific linked
+        Minecraft account, not the discord_id source_key), is checked against any
+        presence oracle configured for this server (see _check_presence).
 
         Returns a view dict."""
         server = report["server"]
@@ -484,6 +502,13 @@ class Store:
             if tier in _CORROBORATED_TIERS:
                 identity_hash = self._identity_hash(server, source_key)
                 if not self._check_travel_plausible(identity_hash, report["road"], seg, along, cx, cz, now):
+                    counts_toward_corroboration = False
+                    self._adjust_trust(identity_hash, -TRUST_PENALTY, now)
+                if tier == "B" and mc_uid is not None and self._check_presence(server, mc_uid) is False:
+                    # False (confirmed absent), not None (unknown/unreachable) --
+                    # see _check_presence for why an oracle outage never costs
+                    # anything. Independent of the travel-plausibility check
+                    # above: both can fire on the same report, each its own signal.
                     counts_toward_corroboration = False
                     self._adjust_trust(identity_hash, -TRUST_PENALTY, now)
                 weight = self._get_trust(identity_hash)
@@ -827,6 +852,12 @@ class Auth:
         """The discord_id behind a live, linked Tier B token ON THIS SERVER, or None."""
         return self.links.discord_identity_for(token, server) if self.links else None
 
+    def mc_uid_for(self, token, server):
+        """The specific mc_uid a live Tier B token is linked to ON THIS SERVER, or
+        None -- used for presence-check, not for corroboration (see
+        tier_b_identity)."""
+        return self.links.mc_uid_for(token, server) if self.links else None
+
     def is_moderator(self, token, server):
         return self.registry.has_scope(token, trust.SCOPE_MODERATOR, server)
 
@@ -860,7 +891,8 @@ class App:
                  read_limit=120, read_window=60, discord_verify=None,
                  discord_client_id=None, discord_redirect_uri=None,
                  trusted_proxies=None, notifier=None,
-                 trusted_write_limit=300, trusted_write_window=60):
+                 trusted_write_limit=300, trusted_write_window=60,
+                 mojang_verify=None):
         self.store = store
         self.auth = auth
         self.limiter = limiter or RateLimiter()
@@ -880,6 +912,10 @@ class App:
         # supplied) -- /link/complete reports that clearly rather than crashing.
         # Injectable so tests never make a real network call to discord.com.
         self.discord_verify = discord_verify
+        # mc_uid, verify_server_id -> True/False. Defaults to the real Mojang
+        # session-server check (identity.mojang_verify_join); injectable so tests
+        # never make a real network call, same pattern as discord_verify.
+        self.mojang_verify = mojang_verify or identity.mojang_verify_join
         # client_id/redirect_uri are NOT secrets (they're meant to be public in an
         # OAuth authorize URL) -- kept here so /link/config can hand them to the
         # website without hardcoding deployment-specific values into committed JS.
@@ -1037,6 +1073,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._registry_issue()
         if path == "/link/init":
             return self._link_init()
+        if path == "/link/verify-ownership":
+            return self._link_verify_ownership()
         if path == "/link/complete":
             return self._link_complete()
         if path == "/link/bot-complete":
@@ -1239,6 +1277,7 @@ class Handler(BaseHTTPRequestHandler):
                 server = obj["server"]
                 creds = self.app.auth.write_credentials(token, server)
                 scope = creds[1] if creds else None
+                mc_uid = None
                 if scope == trust.SCOPE_MAINTAINER:
                     tier, source_key = "M", "tok:" + creds[0]
                 elif scope == trust.SCOPE_FULL:
@@ -1249,8 +1288,11 @@ class Handler(BaseHTTPRequestHandler):
                         # Tier B's corroboration "source" is the discord_id, NOT the
                         # IP or mc_uid -- every UID linked to one identity on this
                         # server counts as one source (SS6.2's dedup rule; falls out
-                        # for free from hashing discord_id).
+                        # for free from hashing discord_id). mc_uid is looked up
+                        # separately (a token is scoped to exactly one linked UID)
+                        # purely for the presence check below.
                         tier, source_key = "B", discord_id
+                        mc_uid = self.app.auth.mc_uid_for(token, server)
                     else:
                         tier, source_key = "C", self._client_ip()
                 if tier in ("A", "M"):
@@ -1272,7 +1314,7 @@ class Handler(BaseHTTPRequestHandler):
                                                   self.app.anon_write_limit, self.app.anon_write_window):
                         rejected.append({"i": i, "reason": "rate limited"})
                         continue
-                self.app.store.ingest(obj, source_key, tier)
+                self.app.store.ingest(obj, source_key, tier, mc_uid=mc_uid)
                 tiers_used.add(tier)
                 accepted += 1
             except ValueError as e:
@@ -1408,7 +1450,37 @@ class Handler(BaseHTTPRequestHandler):
             code = self.app.auth.links.init_link(body.get("mcUid"), server)
         except ValueError as e:
             return self._json(400, {"error": str(e)})
-        self._json(200, {"code": code})
+        # verifyServerId: the nonce the producer feeds into its OWN Mojang
+        # session/minecraft/join call (never sent by this server) to prove it
+        # holds a live session for mcUid -- see /link/verify-ownership.
+        verify_server_id = self.app.auth.links.verify_server_id_for(code)
+        self._json(200, {"code": code, "verifyServerId": verify_server_id})
+
+    def _link_verify_ownership(self):
+        # Second half of the Mojang ownership proof: the producer already made its
+        # own session/minecraft/join call directly to Mojang using the
+        # verifyServerId from /link/init; this just asks Mojang's hasJoined whether
+        # that really happened for the mc_uid this code was init'd for. No token
+        # needed -- same unauthenticated-but-rate-limited posture as /link/init,
+        # since a wrong/guessed code proves nothing without a real prior join.
+        if self.app.auth.links is None:
+            return self._json(503, {"error": "account linking not configured"})
+        if not self.app.limiter.allow("link:" + self._client_ip(),
+                                      self.app.anon_write_limit, self.app.anon_write_window):
+            return self._json(429, {"error": "rate limited"})
+        try:
+            raw = self._read_body()
+            body = json.loads(raw) if raw else {}
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "bad json"})
+        link_code = body.get("linkCode")
+        if not link_code:
+            return self._json(400, {"error": "linkCode required"})
+        try:
+            self.app.auth.links.verify_ownership(link_code, self.app.mojang_verify)
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        self._json(200, {"verified": True})
 
     def _link_complete(self):
         # Called under a Discord-authenticated session (today: the ingest server's
@@ -1692,11 +1764,20 @@ def _wire_events(store, notifier):
     store.on_event = on_event
 
 
+def _default_presence_oracles(args):
+    if not getattr(args, "presence_check", True):
+        return {}
+    # 2b2t.vc's bot network is the only third-party presence source known to
+    # exist as of writing; wired only for 2b2t.org, never assumed for others.
+    return {"2b2t.org": presence.TwoBTwoTVCPresence()}
+
+
 def build_app(args):
+    presence_oracles = _default_presence_oracles(args)
     store = Store(args.geometry, db_path=args.db, bucket=args.bucket,
                   k_anon=args.k_anon, k_tier_b=args.k_tier_b, ttl=args.ttl,
                   clear_factor=args.clear_factor, reopen_window=args.reopen_window,
-                  max_travel_speed=args.max_travel_speed)
+                  max_travel_speed=args.max_travel_speed, presence_oracles=presence_oracles)
     notifier = notify.Notifier(url=getattr(args, "ntfy_url", None),
                                 token=getattr(args, "ntfy_token", None))
     if notifier.enabled:
@@ -1706,7 +1787,8 @@ def build_app(args):
     _seed_discord_admins(registry, args.discord_admin)
     links = identity.LinkStore(db_path=args.identity_db, link_code_ttl=args.link_code_ttl,
                                 max_linked_uids=args.max_linked_uids,
-                                min_discord_age=getattr(args, "min_discord_age_days", 0) * 86400)
+                                min_discord_age=getattr(args, "min_discord_age_days", 0) * 86400,
+                                require_ownership_proof=getattr(args, "require_ownership_proof", True))
     session_store = sessions_mod.SessionStore(db_path=args.session_db, session_ttl=args.session_ttl)
     cfg = {}
     if args.tokens_file and Path(args.tokens_file).exists():
@@ -1777,6 +1859,15 @@ def main(argv=None):
                           "0 disables -- or set ARD_MIN_DISCORD_AGE_DAYS")
     ap.add_argument("--max-linked-uids", type=int, default=identity.DEFAULT_MAX_LINKED_UIDS,
                      help="max Minecraft UIDs one Discord identity may link (MAX_LINKED_UIDS)")
+    ap.add_argument("--require-ownership-proof", action=argparse.BooleanOptionalAction, default=True,
+                     help="require a Mojang session/minecraft/join ownership proof "
+                          "(see /link/verify-ownership) before /link/complete mints a "
+                          "Tier B token; --no-require-ownership-proof for local/dev runs "
+                          "without live Mojang connectivity")
+    ap.add_argument("--presence-check", action=argparse.BooleanOptionalAction, default=True,
+                     help="check a Tier B reporter's linked account against a third-party "
+                          "presence source (2b2t.vc, for 2b2t.org only) at report time; "
+                          "--no-presence-check disables it entirely")
     ap.add_argument("--discord-client-id", help="Discord OAuth app client ID")
     ap.add_argument("--discord-client-secret", help="Discord OAuth app client secret -- keep "
                                                       "this out of shell history/version control; "

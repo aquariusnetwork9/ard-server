@@ -257,22 +257,58 @@ that would give the server true cryptographic inability to link a reputation cre
 issuance to its later use, at the cost of a real cryptographic protocol implementation. This
 version is intentionally the smaller, reviewable step; the full version remains open for later.
 
+### 6.1.2 Presence verification (0.1.4, Tier B only)
+
+A second, independent question from §6.1.1's "is this a real, aged account": is the account
+actually *on this server* right now? A verified, aged Discord identity linking a real Minecraft
+account still proves nothing about whether that account has ever set foot on the server it's
+reporting conditions for. `Store.presence_oracles` is a `{server: oracle}` map (empty by
+default, `--no-presence-check` disables it entirely) where an oracle exposes
+`is_present(mc_uid) -> True/False/None`. As of writing the only oracle wired in is
+`presence.TwoBTwoTVCPresence`, backed by `api.2b2t.vc`'s live tablist feed (public, no auth,
+short-cached) — so this only ever applies to `2b2t.org`; there's no equivalent third-party
+source for `6b6t.org` yet, and the check is simply skipped (never penalized) for any server
+without a configured oracle.
+
+On a Tier B report, if the reporter's specific linked `mc_uid` (looked up per-token, not the
+`discord_id` corroboration source itself — one identity can have several linked UIDs) comes back
+confirmed-absent (`False`), the report is excluded from corroboration and takes the same
+`TRUST_PENALTY` as a travel-implausible report (§6.1.1) — independently; a report can fail both
+checks and take both penalties. A `None` verdict (the oracle is unreachable, or no oracle is
+configured for that server) costs nothing at all and never excludes the report — a third party's
+own downtime must never become a lever against real reporting. Tier C has no linked account to
+check and Tier A/M bypass corroboration entirely, so this only ever touches Tier B.
+
 ### 6.2 Account linking (`POST /link/init` + `POST /link/complete`)
 
 Device-code style, like `gh auth login`. Either producer (`plugin-aquarius` or `client-fabric`)
 can initiate a link to reach Tier B:
 
 1. The producer calls `POST /link/init { mcUid, server }` — **unauthenticated**, since no
-   identity exists yet. `mcUid` is read from the producer's own authenticated Minecraft session
-   (the game/proxy already proved this to Mojang/Microsoft; ARD doesn't re-verify ownership, it
-   just binds *this* session's uid to a fresh code). `server` is whichever anarchy server the
-   producer is actually connected to (§6.3's per-server scoping applies to Tier B the same way it
-   applies to the admin registry — a link established on one server has no standing on another).
-   The server generates a short, high-entropy code (matches the standard device-code-grant
-   pattern — the authorization side mints the code, not the client, avoiding any client-side
-   uniqueness/collision handling), records the pending `(code, mcUid, server)` with a
-   `LINK_CODE_TTL` expiry, and returns the code. Rate-limited per source IP; the record is
-   single-use.
+   identity exists yet. `mcUid` is self-claimed at this point (see step 1.5 below for the real
+   proof). `server` is whichever anarchy server the producer is actually connected to (§6.3's
+   per-server scoping applies to Tier B the same way it applies to the admin registry — a link
+   established on one server has no standing on another). The server generates a short,
+   high-entropy code (matches the standard device-code-grant pattern — the authorization side
+   mints the code, not the client, avoiding any client-side uniqueness/collision handling) *and*
+   a separate `verifyServerId` nonce for step 1.5, records the pending
+   `(code, mcUid, server, verifyServerId)` with a `LINK_CODE_TTL` expiry, and returns both. Rate-
+   limited per source IP; the record is single-use.
+   1.5. **Ownership proof (`MIN_DISCORD_ACCOUNT_AGE`'s counterpart on the Minecraft side, 0.1.4 —
+   required by default, `--require-ownership-proof`).** The producer already holds a live
+   Mojang/Microsoft session for the account it's connected to 2b2t/6b6t with (that's how it got
+   onto the anarchy server in the first place), so it makes its OWN
+   `POST session.minecraft.net/session/minecraft/join { accessToken, selectedProfile: mcUid,
+   serverId: verifyServerId }` call directly to Mojang — this never touches ARD at all, it's
+   purely between the producer and Mojang. The producer then calls
+   `POST /link/verify-ownership { linkCode }`; the server resolves `mcUid` to its current
+   username via Mojang's session-server profile endpoint, then calls
+   `GET session.minecraft.net/session/minecraft/hasJoined?username=..&serverId=verifyServerId` —
+   a 200 with a matching profile id confirms the producer really does hold a live session for
+   that account right now. `complete_link` (step 4) refuses to mint a token until this has
+   passed, when the gate is on (`identity.LinkStore.require_ownership_proof`, defaulting True;
+   `--no-require-ownership-proof` for local/dev runs without live Mojang connectivity). A failed
+   or skipped proof doesn't burn the code — a real join can still be attempted afterward.
 2. The producer displays the code (chat/HUD for `client-fabric`; console/log for
    `plugin-aquarius`).
 3. A human opens `website/link.html` (part of the Phase 3 public map site), enters/confirms the
@@ -286,9 +322,11 @@ can initiate a link to reach Tier B:
    browser-side completion step never needs to know or choose it. The server exchanges
    `discordCode` itself against `discord.com` (client_id/secret configured at deploy time, stdlib
    `urllib` — no extra dependency), resolves the Discord user id, matches `linkCode` to its
-   pending record, links `mcUid` to that identity **on that record's server**, marks the code
-   used, and mints a fresh Tier B bearer token scoped to `(mcUid, server)`. That token is what
-   subsequent `/report` calls to that server authenticate with.
+   pending record (rejecting it if step 1.5's proof is required and hasn't passed), links `mcUid`
+   to that identity **on that record's server**, marks the code used, and mints a fresh Tier B
+   bearer token scoped to `(mcUid, server)`. That token is what subsequent `/report` calls to
+   that server authenticate with. `/link/bot-complete` (§6.2.1) shares this same `complete_link`
+   call, so the ownership-proof gate applies identically to both completion paths.
 
 **Dedup rule (must not be skipped):** an identity may link up to `MAX_LINKED_UIDS` Minecraft
 UIDs **per server** (covers legitimate multiboxers). All UIDs linked to the same Discord identity
@@ -312,9 +350,11 @@ freshly created account" to "an account that predates the campaign." The age com
 snowflake id's embedded creation timestamp (Discord's documented id format), so this adds no
 API call and no extra OAuth scope; both completion paths (§6.2 website OAuth and §6.2.1
 bot-complete) pass through the same check. An id that doesn't parse as a snowflake skips the
-check rather than hard-failing (only test fakes ever look like that). This is the cheap tier of
-the §A4 ladder — the strong fix (a Mojang session-server `hasJoined` proof that the producer
-actually holds the MC account it claims at `/link/init` time) remains a future, bigger phase.
+check rather than hard-failing (only test fakes ever look like that).
+
+Together with step 1.5's Mojang ownership proof above (0.1.4), Tier B now costs a Discord
+account that predates the attempt AND a Minecraft account the producer demonstrably controls
+live — the full two-sided version of the §A4 ladder this section originally deferred.
 
 #### 6.2.1 Bot-authenticated completion (`POST /link/bot-complete`)
 
@@ -479,7 +519,8 @@ cryptographic surface area worth its own careful pass rather than folding into t
 | `/health` | GET | none | liveness only, no data |
 | `/geometry/<server>` | GET | **none (public, rate-limited)** | authoritative road table + `map` + `BUCKET` |
 | `/report` | POST | Tier M / Tier A / Tier B / anon (Tier C) | ingest reports — see §6 |
-| `/link/init` | POST | none (rate-limited) | body `{mcUid, server}` — server mints a pending link code — §6.2 |
+| `/link/init` | POST | none (rate-limited) | body `{mcUid, server}` — server mints a pending link code + a Mojang join-proof `verifyServerId` — §6.2 |
+| `/link/verify-ownership` | POST | none (rate-limited) | body `{linkCode}` — confirms the producer's own prior Mojang `session/minecraft/join` call via `hasJoined`; required before `/link/complete` succeeds unless `--no-require-ownership-proof` — §6.2 step 1.5 |
 | `/link/complete` | POST | none (holds a Discord `discordCode` instead) | resolves a link code + Discord OAuth code into a Tier B token scoped to the `/link/init` record's server — §6.2 |
 | `/link/bot-complete` | POST | `ARD_BOT_SECRET` (first-party bot credential) | resolves a link code + an already-Discord-verified `discordId` into a Tier B token; response includes `server` — §6.2.1 |
 | `/link/config` | GET | none (public, rate-limited) | Discord `clientId`/`redirectUri`/`authorizeUrl` for the website's link page to build the OAuth URL — never the client secret |

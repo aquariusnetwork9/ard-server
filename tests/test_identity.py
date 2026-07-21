@@ -28,9 +28,13 @@ class Clock:
 
 
 class LinkStoreTests(unittest.TestCase):
+    """Dedup/multi-server/suspension behavior -- unrelated to the ownership-proof
+    gate, so it's disabled here (own dedicated tests below)."""
+
     def setUp(self):
         self.clock = Clock()
-        self.store = identity.LinkStore(link_code_ttl=600, max_linked_uids=2, clock=self.clock)
+        self.store = identity.LinkStore(link_code_ttl=600, max_linked_uids=2, clock=self.clock,
+                                        require_ownership_proof=False)
 
     def test_full_link_flow_resolves_to_discord_identity(self):
         code = self.store.init_link("mc-uid-1", S1)
@@ -220,9 +224,10 @@ class MigrationTests(unittest.TestCase):
                 store.db.close()  # Windows can't rmtree a tempdir with an open file handle in it
 
 
-def _mock_response(payload):
+def _mock_response(payload, status=200):
     m = MagicMock()
     m.read.return_value = json.dumps(payload).encode()
+    m.status = status
     m.__enter__.return_value = m
     m.__exit__.return_value = False
     return m
@@ -278,7 +283,8 @@ class DiscordAgeGateTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock(self.NOW)
         self.store = identity.LinkStore(link_code_ttl=600, max_linked_uids=2,
-                                        clock=self.clock, min_discord_age=7 * 86400)
+                                        clock=self.clock, min_discord_age=7 * 86400,
+                                        require_ownership_proof=False)
 
     def test_age_helper_reads_the_snowflake(self):
         age = identity.discord_account_age_seconds(self.snowflake(self.NOW - 3600), self.NOW)
@@ -304,9 +310,120 @@ class DiscordAgeGateTests(unittest.TestCase):
         self.store.complete_link(code, "discord-fake-1")  # must not raise
 
     def test_gate_off_by_default(self):
-        store = identity.LinkStore(link_code_ttl=600, max_linked_uids=2, clock=self.clock)
+        store = identity.LinkStore(link_code_ttl=600, max_linked_uids=2, clock=self.clock,
+                                   require_ownership_proof=False)
         code = store.init_link("mc-uid-1", S1)
         store.complete_link(code, self.snowflake(self.NOW - 60))  # brand new, no gate -> fine
+
+
+
+class MojangVerifyTests(unittest.TestCase):
+    """mojang_verify_join() itself -- the real network-calling implementation
+    verify_ownership() uses, mocked here the same way DiscordExchangeTests
+    mocks discord_exchange()."""
+
+    UID = "cf9876249ba4447faae61c461f6ac03c"
+
+    @patch("identity.urllib.request.urlopen")
+    def test_successful_join_confirms_ownership(self, mock_urlopen):
+        mock_urlopen.side_effect = [
+            _mock_response({"id": self.UID, "name": "Notch"}),
+            _mock_response({"id": self.UID, "name": "Notch"}),
+        ]
+        self.assertTrue(identity.mojang_verify_join(self.UID, "serverid123"))
+
+    @patch("identity.urllib.request.urlopen")
+    def test_every_request_carries_a_real_user_agent(self, mock_urlopen):
+        mock_urlopen.side_effect = [
+            _mock_response({"id": self.UID, "name": "Notch"}),
+            _mock_response({"id": self.UID, "name": "Notch"}),
+        ]
+        identity.mojang_verify_join(self.UID, "serverid123")
+        for call in mock_urlopen.call_args_list:
+            ua = call.args[0].get_header("User-agent")
+            self.assertTrue(ua)
+            self.assertNotIn("python-urllib", ua.lower())
+
+    @patch("identity.urllib.request.urlopen")
+    def test_hasjoined_204_is_not_ownership(self, mock_urlopen):
+        mock_urlopen.side_effect = [
+            _mock_response({"id": self.UID, "name": "Notch"}),
+            _mock_response({}, status=204),
+        ]
+        self.assertFalse(identity.mojang_verify_join(self.UID, "serverid123"))
+
+    @patch("identity.urllib.request.urlopen")
+    def test_mismatched_returned_id_is_rejected(self, mock_urlopen):
+        # Defense in depth -- should never happen since username is resolved
+        # FROM this uid, but a mismatch must never silently pass.
+        mock_urlopen.side_effect = [
+            _mock_response({"id": self.UID, "name": "Notch"}),
+            _mock_response({"id": "some-other-uid", "name": "Notch"}),
+        ]
+        self.assertFalse(identity.mojang_verify_join(self.UID, "serverid123"))
+
+    @patch("identity.urllib.request.urlopen")
+    def test_profile_lookup_failure_is_false_not_a_crash(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "https://sessionserver.mojang.com/session/minecraft/profile/x", 404, "Not Found", {}, io.BytesIO(b""))
+        self.assertFalse(identity.mojang_verify_join(self.UID, "serverid123"))
+
+    @patch("identity.urllib.request.urlopen")
+    def test_network_error_is_false_not_a_crash(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.URLError("timed out")
+        self.assertFalse(identity.mojang_verify_join(self.UID, "serverid123"))
+
+
+class OwnershipProofTests(unittest.TestCase):
+    """verify_ownership() + complete_link()'s gate on it (require_ownership_proof,
+    default True -- PROTOCOL.md §6.2's 'real fix' for A4)."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.store = identity.LinkStore(link_code_ttl=600, max_linked_uids=8, clock=self.clock)
+
+    def test_verify_server_id_is_returned_and_stable(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        vsid = self.store.verify_server_id_for(code)
+        self.assertTrue(vsid)
+        self.assertEqual(self.store.verify_server_id_for(code), vsid, "stable across calls")
+
+    def test_complete_link_requires_verification_by_default(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        with self.assertRaises(ValueError) as cm:
+            self.store.complete_link(code, "discord-1")
+        self.assertIn("not verified", str(cm.exception))
+
+    def test_verify_then_complete_succeeds(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        self.store.verify_ownership(code, mojang_verify=lambda uid, sid: True)
+        token_id, token = self.store.complete_link(code, "discord-1")
+        self.assertIsNotNone(token_id)
+        self.assertEqual(self.store.discord_identity_for(token, S1), "discord-1")
+
+    def test_failed_proof_raises_and_leaves_code_usable(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        with self.assertRaises(ValueError):
+            self.store.verify_ownership(code, mojang_verify=lambda uid, sid: False)
+        # A failed attempt doesn't burn the code -- a real join can still succeed after.
+        self.store.verify_ownership(code, mojang_verify=lambda uid, sid: True)
+        self.store.complete_link(code, "discord-1")  # must not raise
+
+    def test_unknown_code_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.store.verify_ownership("NOPE-CODE", mojang_verify=lambda uid, sid: True)
+
+    def test_expired_code_is_rejected(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        self.clock.t += 601  # past the 600s link_code_ttl
+        with self.assertRaises(ValueError):
+            self.store.verify_ownership(code, mojang_verify=lambda uid, sid: True)
+
+    def test_disabled_gate_allows_completion_without_verification(self):
+        store = identity.LinkStore(link_code_ttl=600, max_linked_uids=8, clock=self.clock,
+                                   require_ownership_proof=False)
+        code = store.init_link("mc-uid-1", S1)
+        store.complete_link(code, "discord-1")  # must not raise
 
 
 
