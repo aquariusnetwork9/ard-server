@@ -37,6 +37,7 @@ from urllib.parse import urlparse, parse_qs
 
 import geometry
 import identity
+import notify
 import sessions as sessions_mod
 import trust
 from geometry import (
@@ -191,7 +192,8 @@ class Store:
 
     def __init__(self, geometry_dir, db_path=":memory:", bucket=DEFAULT_BUCKET,
                  k_anon=2, k_tier_b=2, ttl=3600, clear_factor=2, reopen_window=3600,
-                 salt=None, clock=time.time, max_travel_speed=MAX_TRAVEL_SPEED_DEFAULT):
+                 salt=None, clock=time.time, max_travel_speed=MAX_TRAVEL_SPEED_DEFAULT,
+                 on_event=None):
         self.bucket = bucket
         self.k_anon = k_anon      # Tier C (anonymous, IP-hash) corroboration threshold
         self.k_tier_b = k_tier_b  # Tier B (Discord-verified identity) threshold -- lower than
@@ -203,6 +205,10 @@ class Store:
         self.clear_factor = clear_factor
         self.reopen_window = reopen_window
         self.max_travel_speed = max_travel_speed  # see the reputation-layer note above _TIER_RANK
+        # Optional (kind, details) callback for operationally-interesting moments
+        # (reopen flagged, an identity hitting the trust floor). Must never raise
+        # into store logic -- see _emit.
+        self.on_event = on_event
         self.clock = clock
         self.salt = salt or secrets.token_hex(16)
         self.networks = {}
@@ -345,6 +351,16 @@ class Store:
             (cond_id, now - self.ttl))
         return cur.fetchone()[0]
 
+    def _emit(self, kind, details):
+        """Hand an operational event to on_event, swallowing anything it raises --
+        an alerting hiccup must never fail the ingest that triggered it."""
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(kind, details)
+        except Exception:
+            pass
+
     # ---- reputation layer (see the module-level note above _TIER_RANK) ----
     def _identity_hash(self, server, source_key):
         # Deliberately a DIFFERENT hash space from _source_hash (no cond/seg/along in
@@ -361,11 +377,15 @@ class Store:
         return row[0] if row else TRUST_BASELINE
 
     def _adjust_trust(self, identity_hash, delta, now):
-        trust = max(TRUST_MIN, min(TRUST_MAX, self._get_trust(identity_hash) + delta))
+        prev = self._get_trust(identity_hash)
+        trust = max(TRUST_MIN, min(TRUST_MAX, prev + delta))
         self.db.execute(
             "INSERT INTO identities(identity_hash, trust, last_seen) VALUES(?,?,?)"
             " ON CONFLICT(identity_hash) DO UPDATE SET trust=excluded.trust",
             (identity_hash, trust, now))
+        if prev > TRUST_MIN and trust <= TRUST_MIN:
+            # Crossing the floor (not sitting on it) -- worth a human look.
+            self._emit("trust_floor", {"identityHash": identity_hash})
 
     def _check_travel_plausible(self, identity_hash, road_idx, seg, along, cx, cz, now):
         """True if this identity's last known claimed position (if any) is reachable
@@ -504,6 +524,8 @@ class Store:
                 self.db.commit()
         if reopened:
             self.add_moderation(report, kind="reopen")
+            self._emit("reopen", {"server": server, "road": report["road"],
+                                   "seg": seg, "along": along, "cond": cond})
         self._broadcast(server, view)
         return view
 
@@ -837,12 +859,21 @@ class App:
                  anon_write_limit=60, anon_write_window=60,
                  read_limit=120, read_window=60, discord_verify=None,
                  discord_client_id=None, discord_redirect_uri=None,
-                 trusted_proxies=None):
+                 trusted_proxies=None, notifier=None,
+                 trusted_write_limit=300, trusted_write_window=60):
         self.store = store
         self.auth = auth
         self.limiter = limiter or RateLimiter()
         self.anon_write_limit = anon_write_limit
         self.anon_write_window = anon_write_window
+        # Per-token ceiling for registry-scoped (A/M) writes. Sized well above any
+        # honest reporter's sustained volume -- it exists to bound a runaway or
+        # mishandled token, not to shape normal traffic. Tripping it also raises an
+        # alert (see notify()) since a trip is exactly the moment to look at the
+        # registry.
+        self.trusted_write_limit = trusted_write_limit
+        self.trusted_write_window = trusted_write_window
+        self.notifier = notifier
         self.read_limit = read_limit
         self.read_window = read_window
         # discord_code -> discord_id. None until configured (no client id/secret
@@ -858,6 +889,11 @@ class App:
         # so a caller can widen or fully disable header-trust deliberately.
         self.trusted_proxies = _parse_networks(
             DEFAULT_TRUSTED_PROXIES if trusted_proxies is None else trusted_proxies)
+
+    def notify(self, key, title, message, priority="default"):
+        """Throttled alert dispatch -- a no-op unless a notifier is configured."""
+        if self.notifier is not None:
+            self.notifier.send(key, title, message, priority)
 
     def trusts_peer(self, peer):
         """Whether `peer` (the raw socket address a request arrived from) is allowed
@@ -1217,7 +1253,21 @@ class Handler(BaseHTTPRequestHandler):
                         tier, source_key = "B", discord_id
                     else:
                         tier, source_key = "C", self._client_ip()
-                if tier not in ("A", "M"):
+                if tier in ("A", "M"):
+                    # Per-token ceiling (keyed on the holder, not the shared IP).
+                    if not self.app.limiter.allow("trusted:" + source_key,
+                                                  self.app.trusted_write_limit,
+                                                  self.app.trusted_write_window):
+                        rejected.append({"i": i, "reason": "rate limited"})
+                        self.app.notify(
+                            "trusted-cap:" + source_key,
+                            "ARD: trusted token hit its write cap",
+                            f"{scope} token {creds[0]} on {server} exceeded "
+                            f"{self.app.trusted_write_limit} reports/"
+                            f"{self.app.trusted_write_window}s — review the registry.",
+                            priority="high")
+                        continue
+                else:
                     if not self.app.limiter.allow("write:" + self._client_ip(),
                                                   self.app.anon_write_limit, self.app.anon_write_window):
                         rejected.append({"i": i, "reason": "rate limited"})
@@ -1612,7 +1662,29 @@ def apply_env_secrets(args, environ=None):
     proxy_entries = [s.strip() for s in environ.get("ARD_TRUSTED_PROXIES", "").split(",") if s.strip()]
     if proxy_entries:
         args.trusted_proxy = (getattr(args, "trusted_proxy", None) or []) + proxy_entries
+    if not getattr(args, "ntfy_url", None):
+        args.ntfy_url = environ.get("ARD_NTFY_URL") or None
+    if not getattr(args, "ntfy_token", None):
+        args.ntfy_token = environ.get("ARD_NTFY_TOKEN") or None
     return args
+
+
+def _wire_events(store, notifier):
+    """Route Store operational events into throttled push alerts."""
+    def on_event(kind, d):
+        if kind == "reopen":
+            notifier.send(
+                f"reopen:{d['server']}:{d['road']}:{d['seg']}:{d['along']}",
+                "ARD: clear reopened",
+                f"{d['server']} road {d['road']} seg {d['seg']} along {d['along']}: "
+                f"{d['cond']} re-reported shortly after a clear — in the moderation queue.")
+        elif kind == "trust_floor":
+            notifier.send(
+                f"trust-floor:{d['identityHash']}",
+                "ARD: identity hit the trust floor",
+                f"identity {d['identityHash']} was repeatedly discounted down to the "
+                f"trust floor — worth a moderator look.")
+    store.on_event = on_event
 
 
 def build_app(args):
@@ -1620,6 +1692,10 @@ def build_app(args):
                   k_anon=args.k_anon, k_tier_b=args.k_tier_b, ttl=args.ttl,
                   clear_factor=args.clear_factor, reopen_window=args.reopen_window,
                   max_travel_speed=args.max_travel_speed)
+    notifier = notify.Notifier(url=getattr(args, "ntfy_url", None),
+                                token=getattr(args, "ntfy_token", None))
+    if notifier.enabled:
+        _wire_events(store, notifier)
     registry = trust.Registry(db_path=args.registry_db)
     _seed_registry(registry, args.seed_token)
     _seed_discord_admins(registry, args.discord_admin)
@@ -1641,7 +1717,9 @@ def build_app(args):
     return App(store, auth, discord_verify=discord_verify,
                discord_client_id=args.discord_client_id,
                discord_redirect_uri=args.discord_redirect_uri,
-               trusted_proxies=trusted_proxies)
+               trusted_proxies=trusted_proxies, notifier=notifier,
+               trusted_write_limit=getattr(args, "trusted_write_limit", 300),
+               trusted_write_window=getattr(args, "trusted_write_window", 60))
 
 
 def main(argv=None):
@@ -1716,6 +1794,17 @@ def main(argv=None):
                           "CF-Connecting-IP/X-Forwarded-For, in addition to loopback "
                           "(always trusted) -- or set ARD_TRUSTED_PROXIES to a "
                           "comma-separated list of the same")
+    ap.add_argument("--ntfy-url",
+                     help="full ntfy topic URL for operational alerts (write-cap trips, "
+                          "reopen flags, trust-floor hits); alerts are off when unset -- "
+                          "or set ARD_NTFY_URL")
+    ap.add_argument("--ntfy-token",
+                     help="optional bearer token for the ntfy topic -- prefer "
+                          "ARD_NTFY_TOKEN in production (CLI flags land in ps aux)")
+    ap.add_argument("--trusted-write-limit", type=int, default=300,
+                     help="per-token report ceiling for registry-scoped (A/M) writes")
+    ap.add_argument("--trusted-write-window", type=int, default=60,
+                     help="window in seconds for --trusted-write-limit")
     args = apply_env_secrets(ap.parse_args(argv))
 
     app = build_app(args)

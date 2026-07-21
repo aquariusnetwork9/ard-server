@@ -352,6 +352,13 @@ different servers):
 | `maintainer` (Tier M) | top tier — publish + clear anything unilaterally, including own raises |
 | `moderator` | adjudicate the `/moderation` queue and suspend/reinstate Tier B/C identities (§6.5) — **not** report-publishing power |
 
+**Ceiling + tripwire (2026-07-21):** registry-scoped (A/M) writes carry a generous per-token
+rate cap (`--trusted-write-limit`/`--trusted-write-window`, default 300/60s — far above honest
+reporter volume; it bounds a runaway or mishandled token, keyed on the token, not the shared
+fleet IP). Tripping the cap, a reopen flag landing in moderation, or an identity crossing the
+trust floor each raise a throttled push alert over ntfy (`--ntfy-url`/`ARD_NTFY_URL`, optional
+`ARD_NTFY_TOKEN`; alerts are off when unset). Detection is what makes revocation actionable.
+
 Only an **Owner** can issue or revoke registry entries of any scope, including `moderator` —
 the registry delegates day-to-day *report* adjudication, not the ability to hand out trust.
 Owner is out-of-band, set up at deploy time (not itself a registry entry, to sidestep the

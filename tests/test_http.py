@@ -863,5 +863,70 @@ class TrustedProxyTests(unittest.TestCase):
         self.assertEqual(at_spot, [], "both requests share the real peer address -- still just one source")
 
 
+class TrustedWriteCapTests(unittest.TestCase):
+    """Per-token ceiling on registry-scoped (A/M) writes, with an alert on the trip.
+    Own class/server: hammering this budget must not leak 429s elsewhere."""
+
+    @classmethod
+    def setUpClass(cls):
+        import notify as notify_mod
+        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-cap")
+        registry = trust.Registry()
+        registry.issue("cap-bot", "test-owner", trust.SCOPE_FULL, SERVER, token=FULL_TOKEN)
+        registry.issue("cap-crew", "test-owner", trust.SCOPE_MAINTAINER, SERVER, token=MAINTAINER_TOKEN)
+        auth = Auth(registry, links=None)
+        cls.alerts = []
+        notifier = notify_mod.Notifier(
+            url="https://ntfy.test/topic", async_send=False,
+            transport=lambda title, msg, prio: cls.alerts.append((title, msg, prio)))
+        cls.app = App(store, auth, notifier=notifier,
+                      trusted_write_limit=5, trusted_write_window=60)
+        cls.srv = Server(("127.0.0.1", 0), cls.app)
+        cls.port = cls.srv.server_address[1]
+        cls.net = store.networks[SERVER]
+        cls.map = store.map_hashes[SERVER]
+        cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.t.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def a_report(self, x, cond="HOLE"):
+        return reference_client.build_report(x, 120, 0, "NETHER", self.net, self.map,
+                                             SERVER, cond=cond)
+
+    def test_full_scope_token_is_capped_and_alerted(self):
+        # Distinct along-buckets so every item is a distinct, valid report.
+        results = []
+        for i in range(8):
+            r = self.a_report(x=10000 + i * 100)
+            code, body = req("POST", self.url("/report"), token=FULL_TOKEN, body=r)
+            self.assertEqual(code, 200)
+            results.append((body["accepted"], body["rejected"]))
+        accepted = sum(a for a, _ in results)
+        rejected = [rej for _, rj in results for rej in rj]
+        self.assertEqual(accepted, 5, "cap of 5 -> exactly 5 accepted")
+        self.assertTrue(all(r["reason"] == "rate limited" for r in rejected))
+        self.assertTrue(self.alerts, "tripping the cap raises an alert")
+        title, msg, prio = self.alerts[0]
+        self.assertIn("write cap", title)
+        self.assertEqual(prio, "high")
+        self.assertEqual(len(self.alerts), 1, "repeat trips inside min_interval stay throttled")
+
+    def test_maintainer_token_has_its_own_independent_bucket(self):
+        # The M token was untouched by the A token's exhaustion above (per-token,
+        # not per-IP -- both arrive from loopback).
+        r = self.a_report(x=20000, cond="CLEAR")
+        code, body = req("POST", self.url("/report"), token=MAINTAINER_TOKEN, body=r)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["accepted"], 1)
+        self.assertEqual(body["tiers"], ["M"])
+
+
+
 if __name__ == "__main__":
     unittest.main()

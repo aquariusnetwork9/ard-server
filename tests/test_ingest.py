@@ -454,5 +454,52 @@ class ReputationTests(unittest.TestCase):
         self.assertTrue(v["published"], "Tier A auto-publishes and is never travel-checked")
 
 
+class StoreEventTests(unittest.TestCase):
+    """on_event hook: reopen flags and trust-floor crossings surface as events."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.events = []
+        self.store = Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt",
+                           on_event=lambda kind, d: self.events.append((kind, d)))
+        self.net = self.store.networks[SERVER]
+        self.map = self.store.map_hashes[SERVER]
+
+    def report(self, x, z, cond="HOLE"):
+        r = reference_client.build_report(x, 120, z, "NETHER", self.net, self.map, SERVER,
+                                          cond=cond, now=self.clock.t)
+        self.assertIsNotNone(r)
+        return r
+
+    def test_reopen_fires_event(self):
+        self.store.ingest(self.report(8000, 0, cond="HOLE"), "10.0.0.1", "A")
+        self.clock.t += 5
+        self.store.ingest(self.report(8000, 0, cond="CLEAR"), "tok:m1", "M")
+        self.clock.t += 5  # within reopen_window
+        self.store.ingest(self.report(8000, 0, cond="HOLE"), "10.0.0.3", "A")
+        kinds = [k for k, _ in self.events]
+        self.assertIn("reopen", kinds)
+        d = dict(self.events)["reopen"]
+        self.assertEqual(d["server"], SERVER)
+        self.assertEqual(d["cond"], "HOLE")
+
+    def test_trust_floor_crossing_fires_once(self):
+        ih = self.store._identity_hash(SERVER, "10.0.0.9")
+        for _ in range(10):
+            self.store._adjust_trust(ih, -TRUST_PENALTY, self.clock.t)
+        floors = [d for k, d in self.events if k == "trust_floor"]
+        self.assertEqual(len(floors), 1, "fires on the crossing, not on every further penalty")
+        self.assertEqual(floors[0]["identityHash"], ih)
+
+    def test_event_callback_error_never_breaks_ingest(self):
+        self.store.on_event = lambda kind, d: (_ for _ in ()).throw(RuntimeError("boom"))
+        self.store.ingest(self.report(8100, 0, cond="HOLE"), "10.0.0.1", "A")
+        self.clock.t += 5
+        self.store.ingest(self.report(8100, 0, cond="CLEAR"), "tok:m1", "M")
+        self.clock.t += 5
+        v = self.store.ingest(self.report(8100, 0, cond="HOLE"), "10.0.0.3", "A")
+        self.assertTrue(v["published"], "a raising event callback must not fail the ingest")
+
+
 if __name__ == "__main__":
     unittest.main()

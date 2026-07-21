@@ -78,6 +78,19 @@ class ApplyEnvSecretsTests(unittest.TestCase):
                                   environ={"ARD_TRUSTED_PROXIES": "10.0.0.2/32"})
         self.assertEqual(args.trusted_proxy, ["10.0.0.1/32", "10.0.0.2/32"])
 
+    def test_ntfy_env_fills_in_when_cli_absent(self):
+        args = apply_env_secrets(_args(), environ={"ARD_NTFY_URL": "https://ntfy.test/t",
+                                                    "ARD_NTFY_TOKEN": "tk"})
+        self.assertEqual(args.ntfy_url, "https://ntfy.test/t")
+        self.assertEqual(args.ntfy_token, "tk")
+
+    def test_ntfy_cli_wins_over_env(self):
+        args = apply_env_secrets(_args(ntfy_url="https://cli.test/t", ntfy_token="cli-tk"),
+                                  environ={"ARD_NTFY_URL": "https://env.test/t",
+                                            "ARD_NTFY_TOKEN": "env-tk"})
+        self.assertEqual(args.ntfy_url, "https://cli.test/t")
+        self.assertEqual(args.ntfy_token, "cli-tk")
+
 
 class SeedDiscordAdminsTests(unittest.TestCase):
     def test_seeds_a_live_admin_grant(self):
