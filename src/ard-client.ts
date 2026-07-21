@@ -10,7 +10,7 @@ export interface CompleteLinkResult {
 
 /**
  * Completes a pending /link/init code via ARD's bot-authenticated path
- * (PROTOCOL.md SS6.2.1) -- proves the bot's own identity with ARD_BOT_SECRET
+ * (PROTOCOL.md SS6.1) -- proves the bot's own identity with ARD_BOT_SECRET
  * instead of a Discord OAuth code, since discordId is already Discord-verified
  * (it comes straight off the slash-command interaction).
  */

@@ -15,7 +15,7 @@
  *
  * Highway Worker and Highway Supervisor split per-server (2b2t/6b6t) because
  * ARD's own Tier A/B grants are strictly per-server -- someone verified on
- * 2b2t.org has zero standing on 6b6t.org by design (PROTOCOL.md SS6.2/SS6.3).
+ * 2b2t.org has zero standing on 6b6t.org by design (PROTOCOL.md SS6).
  * Everything else is a Discord-side rank with no server-specific ARD meaning.
  */
 
