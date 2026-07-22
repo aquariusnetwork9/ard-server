@@ -232,7 +232,7 @@ export const CATEGORIES: CategorySpec[] = [
       { name: '🗨️・2b2t-general', oldNames: ['2b2t-general'] },
       { name: '🗺️・2b2t-highway-map', topic: 'https://map.aquariusconnect.org', oldNames: ['2b2t-highway-map'] },
       { name: '🆘・2b2t-help', oldNames: ['2b2t-help'] },
-      { name: '📰・press-releases', topic: 'Official dispatches from Highway Command -- 2b2t-specific news, incl. the rewards program.', readOnly: true },
+      { name: '📰・2b2t-press-releases', topic: 'Official dispatches from Highway Command -- 2b2t-specific news, incl. the rewards program.', readOnly: true },
     ],
   },
   {
@@ -243,7 +243,7 @@ export const CATEGORIES: CategorySpec[] = [
       { name: '🗨️・6b6t-general', oldNames: ['6b6t-general'] },
       { name: '🗺️・6b6t-highway-map', topic: 'https://map.aquariusconnect.org', oldNames: ['6b6t-highway-map'] },
       { name: '🆘・6b6t-help', oldNames: ['6b6t-help'] },
-      { name: '📰・press-releases', topic: 'Official dispatches from Highway Command -- 6b6t-specific news, incl. the rewards program.', readOnly: true },
+      { name: '📰・6b6t-press-releases', topic: 'Official dispatches from Highway Command -- 6b6t-specific news, incl. the rewards program.', readOnly: true, oldNames: ['📰・press-releases'] },
     ],
   },
   {
