@@ -21,8 +21,8 @@ import { buildRulesEmbed } from '../provision/rules';
 import { buildFaqEmbed } from '../provision/faq';
 import { ONBOARDING_DEFAULT_CHANNEL_KEYS, ONBOARDING_PROMPT } from '../provision/onboarding';
 import {
-  STAFF_ROLES_FOR_MODERATION, RESTRICTED_BASE_PERMISSIONS, NO_THREAD_PERMISSIONS,
-  MENTION_EVERYONE_ROLES, UNMENTIONABLE_ROLES, AUTOMOD_RULES,
+  STAFF_ROLES_FOR_MODERATION, RESTRICTED_BASE_PERMISSIONS, RESTRICTED_PERMISSIONS_EXEMPT_ROLES,
+  NO_THREAD_PERMISSIONS, MENTION_EVERYONE_ROLES, UNMENTIONABLE_ROLES, AUTOMOD_RULES,
 } from '../provision/moderation';
 
 export const data = new SlashCommandBuilder()
@@ -141,10 +141,11 @@ async function runSetup(interaction: ChatInputCommandInteraction, guild: NonNull
   await upsertPinnedEmbed(interaction, created, existing, faqChannel, confirm, FAQ_EMBED_TITLE,
     () => buildFaqEmbed(verifyChannel?.id), 'FAQ message');
 
-  // 4. Server-wide moderation: strip file uploads + thread creation from the
-  // public, re-grant uploads to staff (never thread creation -- no one gets
-  // that back), protect Director/Branch Director from being @mentioned by
-  // the public, and block invite/GIF links via AutoMod.
+  // 4. Server-wide moderation: strip file uploads + embeds + thread creation
+  // from the public, re-grant uploads/embeds to staff and leaderboard/reward
+  // roles (never thread creation -- no one gets that back), protect
+  // Director/Branch Director from being @mentioned by the public, and block
+  // invite/GIF links via AutoMod.
   await applyModeration(guild, roleByName, confirm, created, renamed, existing);
 
   // 5. Native Discord onboarding: default channels + one informational
@@ -218,20 +219,24 @@ async function applyModeration(
   guild: NonNullable<ChatInputCommandInteraction['guild']>, roleByName: Map<string, Role>, confirm: boolean,
   created: string[], renamed: string[], existing: string[]
 ): Promise<void> {
-  // -- Base permissions: strip file uploads + thread creation from @everyone.
-  // File uploads come back for staff below; thread creation does not -- "no
-  // one should be able to start threads in ANY channel" had no staff exception.
+  // -- Base permissions: strip file uploads + embeds + thread creation from
+  // @everyone. Uploads/embeds come back for RESTRICTED_PERMISSIONS_EXEMPT_ROLES
+  // below; thread creation does not -- "no one should be able to start
+  // threads in ANY channel" had no exception.
   const everyone = guild.roles.everyone;
   const toStrip = [...RESTRICTED_BASE_PERMISSIONS, ...NO_THREAD_PERMISSIONS];
   if (toStrip.some(p => everyone.permissions.has(p))) {
     if (confirm) await everyone.setPermissions(everyone.permissions.remove(toStrip));
-    renamed.push('@everyone: removed file-upload + thread-creation permissions');
+    renamed.push('@everyone: removed file-upload + embed + thread-creation permissions');
   } else {
-    existing.push('@everyone: file uploads + threads already restricted');
+    existing.push('@everyone: file uploads + embeds + threads already restricted');
   }
 
-  for (const roleName of STAFF_ROLES_FOR_MODERATION) {
-    const role = roleByName.get(roleName);
+  // roleByName only covers roles /setup itself declares in structure.ts's
+  // ROLES list. "Supporter" is granted by hand outside /setup entirely, so
+  // fall back to a live guild.roles.cache lookup by name for it.
+  for (const roleName of RESTRICTED_PERMISSIONS_EXEMPT_ROLES) {
+    const role = roleByName.get(roleName) ?? guild.roles.cache.find(r => r.name === roleName);
     if (!role) continue;
     const wantsAttach = !role.permissions.has(RESTRICTED_BASE_PERMISSIONS);
     const wantsMentionEveryone = MENTION_EVERYONE_ROLES.includes(roleName)
@@ -243,9 +248,9 @@ async function applyModeration(
         if (wantsMentionEveryone) perms = perms.add('MentionEveryone');
         await role.setPermissions(perms);
       }
-      renamed.push(`role "${roleName}": granted staff permissions (uploads/mention-everyone)`);
+      renamed.push(`role "${roleName}": granted permissions (uploads/embeds${wantsMentionEveryone ? '/mention-everyone' : ''})`);
     } else {
-      existing.push(`role "${roleName}": staff permissions already granted`);
+      existing.push(`role "${roleName}": permissions already granted`);
     }
   }
 
