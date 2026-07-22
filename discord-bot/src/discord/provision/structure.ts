@@ -181,8 +181,14 @@ export interface ChannelSpec {
   // than the category default AND post-only-by-staff.
   visibleTo?: string[];
   // Anyone who can view this channel may still not post in it, except the
-  // staff roles in moderation.ts's STAFF_ROLES_FOR_MODERATION.
+  // staff roles in moderation.ts's STAFF_ROLES_FOR_MODERATION -- or, if
+  // `postRoles` is set, exactly those roles instead (narrower or entirely
+  // different from the usual staff set). Bot roles never need listing here:
+  // an Administrator-permission role (Highway Bot, Wick) bypasses every
+  // channel overwrite regardless, confirmed live against this guild's actual
+  // role permissions before relying on it.
   readOnly?: boolean;
+  postRoles?: string[];
 }
 
 export interface CategorySpec {
@@ -232,7 +238,7 @@ export const CATEGORIES: CategorySpec[] = [
       { name: '🗨️・2b2t-general', oldNames: ['2b2t-general'] },
       { name: '🗺️・2b2t-highway-map', topic: 'https://map.aquariusconnect.org', oldNames: ['2b2t-highway-map'] },
       { name: '🆘・2b2t-help', oldNames: ['2b2t-help'] },
-      { name: '📰・2b2t-press-releases', topic: 'Official dispatches from Highway Command -- 2b2t-specific news, incl. the rewards program.', readOnly: true },
+      { name: '📰・2b2t-press-releases', topic: 'Official dispatches from Highway Command -- 2b2t-specific news, incl. the rewards program.', readOnly: true, postRoles: ['Director'] },
     ],
   },
   {
@@ -243,7 +249,7 @@ export const CATEGORIES: CategorySpec[] = [
       { name: '🗨️・6b6t-general', oldNames: ['6b6t-general'] },
       { name: '🗺️・6b6t-highway-map', topic: 'https://map.aquariusconnect.org', oldNames: ['6b6t-highway-map'] },
       { name: '🆘・6b6t-help', oldNames: ['6b6t-help'] },
-      { name: '📰・6b6t-press-releases', topic: 'Official dispatches from Highway Command -- 6b6t-specific news, incl. the rewards program.', readOnly: true, oldNames: ['📰・press-releases'] },
+      { name: '📰・6b6t-press-releases', topic: 'Official dispatches from Highway Command -- 6b6t-specific news, incl. the rewards program.', readOnly: true, postRoles: ['Director'], oldNames: ['📰・press-releases'] },
     ],
   },
   {

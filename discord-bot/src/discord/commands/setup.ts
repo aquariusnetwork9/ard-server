@@ -107,18 +107,21 @@ async function runSetup(interaction: ChatInputCommandInteraction, guild: NonNull
       // A channel with its own visibleTo narrows below the category default
       // (e.g. Barracks under Staff, visible to Highway Patrol + Director but
       // not Branch Director). A `readOnly` channel denies SendMessages to
-      // everyone except staff. Both together (e.g. Dispatch Center's queue
+      // everyone except staff -- or, if the channel sets `postRoles`, exactly
+      // that (narrower or different) role list instead of the usual staff
+      // set. Both narrowing forms together (e.g. Dispatch Center's queue
       // channels: narrower than the Worker-and-up category default AND
       // post-only-by-staff) go through buildComposedOverwrites, which merges
       // both permissions per role instead of emitting two conflicting
       // overwrite entries for the same id. Neither set means it just
       // inherits the category's visibility as-is.
+      const postRoles = ch.postRoles ?? STAFF_ROLES_FOR_MODERATION;
       const chOverwrites = ch.visibleTo && ch.readOnly
-        ? buildComposedOverwrites(everyoneId, ch.visibleTo, cat.visibleTo, STAFF_ROLES_FOR_MODERATION, roleByName)
+        ? buildComposedOverwrites(everyoneId, ch.visibleTo, cat.visibleTo, postRoles, roleByName)
         : ch.visibleTo
         ? buildOverwrites(everyoneId, ch.visibleTo, cat.visibleTo, roleByName)
         : ch.readOnly
-        ? buildReadOnlyOverwrites(everyoneId, STAFF_ROLES_FOR_MODERATION, roleByName)
+        ? buildReadOnlyOverwrites(everyoneId, postRoles, roleByName)
         : undefined;
       const { channel, outcome: chOutcome } = await findOrCreateTextChannel(
         guild, ch.name, ch.topic, category?.id ?? null, !confirm, ch.oldNames, chOverwrites
