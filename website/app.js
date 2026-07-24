@@ -117,6 +117,7 @@
   var refreshTimer = null;
   var refreshPending = false;
   var activityTimer = null;
+  var loadGeneration = 0;
 
   function buildLegend() {
     legendItems.innerHTML = "";
@@ -141,9 +142,22 @@
   }
 
   function fetchJSON(url) {
-    return fetch(url).then(function (r) {
-      if (!r.ok) throw new Error(url + " -> " + r.status);
-      return r.json();
+    // Without a timeout, a proxy/backend hang (accepts the connection, never
+    // responds) leaves whatever UI state depends on this fetch stuck forever
+    // (e.g. loadServer's "loading…" status never resolving to anything).
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, 15000);
+    return fetch(url, { signal: controller.signal })
+      .then(function (r) {
+        if (!r.ok) throw new Error(url + " -> " + r.status);
+        return r.json();
+      })
+      .finally(function () { clearTimeout(timer); });
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c];
     });
   }
 
@@ -155,20 +169,24 @@
   }
 
   function popupHTML(v) {
+    // Every value here is currently numeric/enum/backend-controlled, so
+    // there's no live injection path today -- escaped anyway so this stays
+    // true even if a future field (e.g. a free-text report note) gets added
+    // here without anyone remembering to revisit this specific function.
     var s = COND_STYLE[v.cond] || DEFAULT_STYLE;
     var lines = [
-      "<b>" + s.label + "</b> (tier " + v.tier + ")"
+      "<b>" + escapeHtml(s.label) + "</b> (tier " + escapeHtml(v.tier) + ")"
         + (v.published ? "" : " — <span class=\"unconfirmed-tag\">unconfirmed</span>"),
-      "reports: " + v.reports + " · distinct sources: " + v.distinctSources,
-      "confidence: " + v.confidence,
+      "reports: " + escapeHtml(v.reports) + " · distinct sources: " + escapeHtml(v.distinctSources),
+      "confidence: " + escapeHtml(v.confidence),
     ];
     if (!v.published) {
       lines.push("one more report (any tier) would confirm this");
     }
     if (v.laneMin !== null && v.laneMin !== undefined) {
-      lines.push("lane span: " + v.laneMin + " .. " + v.laneMax);
+      lines.push("lane span: " + escapeHtml(v.laneMin) + " .. " + escapeHtml(v.laneMax));
     }
-    lines.push("last seen " + agoString(v.lastSeen));
+    lines.push("last seen " + escapeHtml(agoString(v.lastSeen)));
     return '<div class="hz-popup">' + lines.join("<br>") + "</div>";
   }
 
@@ -295,7 +313,21 @@
     // patch feed -- CLEAR/reopen reconciliation only happens at query() time, so
     // the simplest correct thing is to just re-fetch the authoritative list.
     eventSource.onmessage = function () { refreshConditions(); };
-    eventSource.onerror = function () { setConn("stale", "live stream reconnecting…"); };
+    eventSource.onerror = function () {
+      setConn("stale", "live stream reconnecting…");
+      // The browser auto-retries most transient errors on its own, but if
+      // the connection was closed in a way the native EventSource won't
+      // retry (e.g. a non-200 from a proxy in front of /stream), readyState
+      // goes CLOSED and it silently gives up forever -- the status line
+      // would keep claiming "reconnecting" with nothing actually retrying.
+      // Guarded by currentServer === server so a stale reconnect from an
+      // old server selection can't fire after the user's switched away.
+      if (eventSource.readyState === EventSource.CLOSED && currentServer === server) {
+        setTimeout(function () {
+          if (currentServer === server) connectStream(server);
+        }, 5000);
+      }
+    };
   }
 
   // ALWAYS anonymous -- the server never sends identity on this route at all,
@@ -315,8 +347,8 @@
           var road = roadsForLabels[r.road] ? roadsForLabels[r.road].text : "road #" + r.road;
           var row = document.createElement("div");
           row.className = "activity-row";
-          row.innerHTML = "<b>" + s.label + "</b> @ " + road + " seg " + r.seg
-            + " · " + agoString(r.createdAt);
+          row.innerHTML = "<b>" + escapeHtml(s.label) + "</b> @ " + escapeHtml(road) + " seg " + escapeHtml(r.seg)
+            + " · " + escapeHtml(agoString(r.createdAt));
           el.appendChild(row);
         });
       })
@@ -324,12 +356,22 @@
   }
 
   function loadServer(server) {
+    // Guards against rapid double-switching: without this, a slow first
+    // geometry fetch that resolves AFTER a second loadServer call would still
+    // unconditionally overwrite refreshTimer/activityTimer with its own
+    // (now-orphaned) intervals -- permanently leaking them (nothing left
+    // holds a reference to clear) and briefly redrawing the wrong server's
+    // roads/hazards on top of the newer selection.
+    var myGeneration = ++loadGeneration;
     currentServer = server;
     if (refreshTimer) clearInterval(refreshTimer);
     if (activityTimer) clearInterval(activityTimer);
+    refreshTimer = null;
+    activityTimer = null;
     setConn("stale", "loading " + server + "…");
     fetchJSON("/geometry/" + encodeURIComponent(server))
       .then(function (geo) {
+        if (myGeneration !== loadGeneration) return; // superseded by a newer loadServer call
         drawRoads(geo);
         refreshConditions();
         refreshActivity();
@@ -337,7 +379,10 @@
         refreshTimer = setInterval(refreshConditions, 20000);
         activityTimer = setInterval(refreshActivity, 30000);
       })
-      .catch(function () { setConn("down", "couldn't load geometry for " + server); });
+      .catch(function () {
+        if (myGeneration !== loadGeneration) return;
+        setConn("down", "couldn't load geometry for " + server);
+      });
   }
 
   function init() {

@@ -233,13 +233,26 @@ export async function pollOnce(client: Client): Promise<void> {
       const existing = serverState.messageId
         ? await channel.messages.fetch(serverState.messageId).catch(() => null)
         : null;
+      // snapshot is only advanced on a CONFIRMED write -- previously it was
+      // set unconditionally, so a failed edit (rate limit, transient API
+      // error) left the live embed showing stale hazard data indefinitely:
+      // the next cycle would see snapshot already matching and never retry.
       if (existing) {
-        await existing.edit({ embeds: [embed] }).catch(() => {});
+        try {
+          await existing.edit({ embeds: [embed] });
+          serverState.snapshot = snapshot;
+        } catch (err) {
+          console.error(`[radar] Failed to update ${server}'s embed -- will retry next cycle:`, err);
+        }
       } else {
-        const sent = await channel.send({ embeds: [embed] });
-        serverState.messageId = sent.id;
+        try {
+          const sent = await channel.send({ embeds: [embed] });
+          serverState.messageId = sent.id;
+          serverState.snapshot = snapshot;
+        } catch (err) {
+          console.error(`[radar] Failed to post ${server}'s embed -- will retry next cycle:`, err);
+        }
       }
-      serverState.snapshot = snapshot;
     }
     state[server] = serverState;
   }

@@ -47,7 +47,20 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
     return;
   }
 
-  await member.roles.add(role);
+  try {
+    await member.roles.add(role);
+  } catch (err) {
+    // The backend link already succeeded (and the code is now consumed) --
+    // an uncaught throw here used to propagate to index.ts's generic handler
+    // ("Something went wrong"), which reads as the WHOLE command having
+    // failed and invites a pointless retry with a code that's already spent.
+    // Tell them the truth: linked, just missing the role.
+    console.error(`[link] Failed to grant ${roleName} to ${interaction.user.id}:`, err);
+    await interaction.editReply(
+      `Linked for **${result.server}**, but granting the **${roleName}** role failed -- ping an admin, no need to re-run /link.`
+    );
+    return;
+  }
   // Graduate off the default rank -- once someone's a Highway Worker on at
   // least one server, "Traveler" no longer describes them. Best-effort: a
   // missing Traveler role (never ran /setup, or already removed) isn't an

@@ -6,7 +6,7 @@ import {
 } from 'discord.js';
 import { config } from '../../config';
 import { listDispatch, claimDispatch, completeDispatch, roadName, DispatchEntry, ArdDispatchError } from '../../ard-client';
-import { SERVER_ROLE, DISPATCH_CHANNEL_NAMES, DISPATCH_ACCESS_ROLES } from '../provision/structure';
+import { SERVER_ROLE, DISPATCH_CHANNEL_NAMES, GLOBAL_DISPATCH_ROLES, supervisorRoleName } from '../provision/structure';
 import { isCurrentSession } from '../../runtime-lock';
 
 /**
@@ -97,16 +97,20 @@ function openEmbed(server: string, entry: DispatchEntry, target: string): EmbedB
   return embed;
 }
 
-function openComponents(entry: DispatchEntry): ActionRowBuilder<ButtonBuilder>[] {
+// server is embedded in the customId (not just entry.id) so
+// handleDispatchButton can check access against the SPECIFIC server this
+// entry belongs to, not just "any Dispatch Center access role" -- see
+// GLOBAL_DISPATCH_ROLES's comment for why that distinction matters.
+function openComponents(server: string, entry: DispatchEntry): ActionRowBuilder<ButtonBuilder>[] {
   const row = new ActionRowBuilder<ButtonBuilder>();
   if (entry.status === 'queued') {
     row.addComponents(
-      new ButtonBuilder().setCustomId(`dispatch:claim:${entry.id}`)
+      new ButtonBuilder().setCustomId(`dispatch:claim:${server}:${entry.id}`)
         .setLabel('Claim').setStyle(ButtonStyle.Primary),
     );
   } else {
     row.addComponents(
-      new ButtonBuilder().setCustomId(`dispatch:complete:${entry.id}`)
+      new ButtonBuilder().setCustomId(`dispatch:complete:${server}:${entry.id}`)
         .setLabel('Mark complete').setStyle(ButtonStyle.Success),
     );
   }
@@ -141,19 +145,39 @@ export async function pollOnce(client: Client): Promise<void> {
       const target = await describeTarget(server, entry);
 
       if (!tracked) {
-        const msg = await openCh.send({ embeds: [openEmbed(server, entry, target)], components: openComponents(entry) });
+        // Not caught: without a message id there's nothing to track -- skip
+        // this entry entirely (via the outer catch below) and let the next
+        // poll retry it, rather than recording a bogus state entry.
+        let msg;
+        try {
+          msg = await openCh.send({ embeds: [openEmbed(server, entry, target)], components: openComponents(server, entry) });
+        } catch (err) {
+          console.error(`[dispatch] Failed to post #${entry.id} on ${server}:`, err);
+          continue;
+        }
         state[key] = { server, messageId: msg.id, lastStatus: entry.status, lastClaimedBy: entry.claimedBy };
-        await recordsCh.send(`🆕 **${target}** queued (${entry.trigger})`);
+        await recordsCh.send(`🆕 **${target}** queued (${entry.trigger})`).catch(err =>
+          console.error(`[dispatch] Failed to post #records for #${entry.id}:`, err));
         continue;
       }
 
       if (tracked.lastStatus !== entry.status || tracked.lastClaimedBy !== entry.claimedBy) {
         const msg = await openCh.messages.fetch(tracked.messageId).catch(() => null);
-        if (msg) await msg.edit({ embeds: [openEmbed(server, entry, target)], components: openComponents(entry) });
+        if (msg) {
+          await msg.edit({ embeds: [openEmbed(server, entry, target)], components: openComponents(server, entry) }).catch(err =>
+            console.error(`[dispatch] Failed to edit #${entry.id}'s message -- embed may be stale until its next state change:`, err));
+        }
+        // Caught individually rather than left to abort the loop -- ard-server's
+        // queue state (tracked.lastStatus below) is the source of truth and has
+        // already changed regardless of whether Discord accepted these posts;
+        // losing the loop here would also skip saveState() for every other
+        // entry still left to process this cycle.
         if (entry.status === 'claimed' && tracked.lastStatus === 'queued') {
-          await recordsCh.send(`✋ **${target}** claimed by ${actorLabel(entry.claimedBy)}`);
+          await recordsCh.send(`✋ **${target}** claimed by ${actorLabel(entry.claimedBy)}`).catch(err =>
+            console.error(`[dispatch] Failed to post claim record for #${entry.id}:`, err));
         } else if (entry.status === 'queued' && tracked.lastStatus === 'claimed') {
-          await recordsCh.send(`↩️ **${target}**: claim by ${actorLabel(tracked.lastClaimedBy)} expired -- back in the queue`);
+          await recordsCh.send(`↩️ **${target}**: claim by ${actorLabel(tracked.lastClaimedBy)} expired -- back in the queue`).catch(err =>
+            console.error(`[dispatch] Failed to post expiry record for #${entry.id}:`, err));
         }
         tracked.lastStatus = entry.status;
         tracked.lastClaimedBy = entry.claimedBy;
@@ -171,11 +195,18 @@ export async function pollOnce(client: Client): Promise<void> {
     const msg = await openCh.messages.fetch(tracked.messageId).catch(() => null);
     if (msg) await msg.delete().catch(() => {});
     const [server] = key.split(':');
+    // Caught individually, same reasoning as the update branch above -- this
+    // entry is already resolved in ard-server's own state regardless of
+    // whether these posts land, and an uncaught throw here would also skip
+    // every remaining entry's cleanup (and saveState) this cycle.
     if (tracked.lastStatus === 'claimed') {
-      await closedCh.send(`✅ Resolved on **${server}** -- completed by ${actorLabel(tracked.lastClaimedBy)}.`);
-      await recordsCh.send(`✅ dispatch #${key.split(':')[1]} on **${server}** completed by ${actorLabel(tracked.lastClaimedBy)}`);
+      await closedCh.send(`✅ Resolved on **${server}** -- completed by ${actorLabel(tracked.lastClaimedBy)}.`).catch(err =>
+        console.error(`[dispatch] Failed to post #closed for ${key}:`, err));
+      await recordsCh.send(`✅ dispatch #${key.split(':')[1]} on **${server}** completed by ${actorLabel(tracked.lastClaimedBy)}`).catch(err =>
+        console.error(`[dispatch] Failed to post #records for ${key}:`, err));
     } else {
-      await recordsCh.send(`⌛ dispatch #${key.split(':')[1]} on **${server}** expired unclaimed`);
+      await recordsCh.send(`⌛ dispatch #${key.split(':')[1]} on **${server}** expired unclaimed`).catch(err =>
+        console.error(`[dispatch] Failed to post #records for ${key}:`, err));
     }
     delete state[key];
   }
@@ -198,19 +229,30 @@ export function startDispatchPolling(client: Client): void {
 }
 
 /** Whether `member` currently holds a role that grants dispatch access
- *  (PROTOCOL.md SS6.7 / structure.ts's DISPATCH_ACCESS_ROLES) -- the ONLY
- *  place this check happens; ard-server trusts the bot's word entirely. */
-function hasDispatchAccess(member: GuildMember): boolean {
-  return member.roles.cache.some(r => (DISPATCH_ACCESS_ROLES as readonly string[]).includes(r.name));
+ *  SPECIFICALLY for `server` (PROTOCOL.md SS6.7) -- the ONLY place this check
+ *  happens; ard-server trusts the bot's word entirely, so this can't just
+ *  check "any Dispatch Center role" (see GLOBAL_DISPATCH_ROLES's comment): a
+ *  6b6t-only Highway Supervisor must never be able to claim/complete a 2b2t
+ *  dispatch target, or vice versa. */
+function hasDispatchAccess(member: GuildMember, server: string): boolean {
+  const supervisorRole = supervisorRoleName(server);
+  return member.roles.cache.some(r => r.name === supervisorRole
+    || (GLOBAL_DISPATCH_ROLES as readonly string[]).includes(r.name));
 }
 
 export async function handleDispatchButton(interaction: ButtonInteraction): Promise<void> {
-  const [, action, idStr] = interaction.customId.split(':');
+  // Old format (pre server-scoping fix) was `dispatch:<action>:<id>`, 3 parts
+  // -- a stale button from before this deploy fails the id parse below
+  // (NaN) and gets the generic "Could not reach the ARD server" reply via
+  // the catch, rather than silently misauthorizing anyone. Self-heals within
+  // that entry's normal lifecycle (its next status change re-renders the
+  // button with the new format).
+  const [, action, server, idStr] = interaction.customId.split(':');
   const id = Number(idStr);
   const member = interaction.member;
-  if (!(member instanceof GuildMember) || !hasDispatchAccess(member)) {
+  if (!(member instanceof GuildMember) || !hasDispatchAccess(member, server)) {
     await interaction.reply({
-      content: 'You need a Dispatcher, Highway Supervisor, or Highway Inspector role to do that.',
+      content: `You need a ${server ?? 'matching-server'} Highway Supervisor, Highway Inspector, or Dispatcher role to do that.`,
       ephemeral: true,
     });
     return;

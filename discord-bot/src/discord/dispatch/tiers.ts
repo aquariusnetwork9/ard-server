@@ -85,8 +85,17 @@ async function syncTierRoles(
       const role = guild.roles.cache.find(r => r.name === roleName);
       if (!role) continue; // /setup hasn't provisioned this role yet
       if (member.roles.cache.has(role.id)) continue; // already holds it -- stacking, never re-announce
-      await member.roles.add(role).catch(() => {});
-      await recordsCh?.send(`🎉 <@${entry.discordId}> just made **${roleName}** on **${server}**!`).catch(() => {});
+      try {
+        await member.roles.add(role);
+      } catch (err) {
+        // Don't announce a grant that didn't actually happen -- a swallowed
+        // error here previously left the public #records message claiming a
+        // role the member never received.
+        console.error(`[tiers] Failed to grant ${roleName} to ${entry.discordId}:`, err);
+        continue;
+      }
+      await recordsCh?.send(`🎉 <@${entry.discordId}> just made **${roleName}** on **${server}**!`).catch(err =>
+        console.error(`[tiers] Failed to post #records for ${roleName}:`, err));
     }
     // Checked every cycle regardless of whether a tier role was newly granted
     // just above -- self-healing, same as the rest of this job: a member who
@@ -104,10 +113,15 @@ async function grantAutoDispatcher(
   const role = guild.roles.cache.find(r => r.name === DISPATCHER_ROLE);
   if (!role) return; // /setup hasn't provisioned this role yet
   if (member.roles.cache.has(role.id)) return; // already a Dispatcher (auto or staff-granted) -- no re-announce
-  await member.roles.add(role).catch(() => {});
+  try {
+    await member.roles.add(role);
+  } catch (err) {
+    console.error(`[tiers] Failed to auto-grant Dispatcher to ${discordId}:`, err);
+    return;
+  }
   await recordsCh?.send(
     `🚦 <@${discordId}> auto-promoted to **Dispatcher** -- reached **${tierRoleName(server, 'survey', AUTO_DISPATCHER_SURVEY_TIER_INDEX)}** on **${server}**, can now claim/complete repairs!`
-  ).catch(() => {});
+  ).catch(err => console.error(`[tiers] Failed to post #records for Dispatcher auto-promotion (${discordId}):`, err));
 }
 
 async function rotateBadge(
@@ -126,15 +140,36 @@ async function rotateBadge(
 
   if (prevHolderId && prevHolderId !== leaderId) {
     const prevMember = await guild.members.fetch(prevHolderId).catch(() => null);
-    if (prevMember?.roles.cache.has(role.id)) await prevMember.roles.remove(role).catch(() => {});
-  }
-  if (leaderId && leaderId !== prevHolderId) {
-    const newMember = await guild.members.fetch(leaderId).catch(() => null);
-    if (newMember) {
-      await newMember.roles.add(role).catch(() => {});
-      await recordsCh?.send(`🏆 <@${leaderId}> is the new **${badgeName}** on **${server}**!`).catch(() => {});
+    if (prevMember?.roles.cache.has(role.id)) {
+      await prevMember.roles.remove(role).catch(err =>
+        console.error(`[tiers] Failed to strip ${badgeName} from ${prevHolderId}:`, err));
     }
   }
+
+  if (!leaderId || leaderId === prevHolderId) {
+    // No leader (empty leaderboard this period) or no change -- nothing to
+    // grant, safe to record either way.
+    serverState.holders[cadence][track] = leaderId;
+    return;
+  }
+
+  const newMember = await guild.members.fetch(leaderId).catch(() => null);
+  if (!newMember) {
+    // Couldn't resolve the new leader (rate limit, left the guild, etc) --
+    // leave serverState untouched (still pointing at prevHolderId) so the
+    // next cycle retries granting this badge instead of silently treating
+    // the grant as done.
+    console.error(`[tiers] Could not fetch leader ${leaderId} for ${badgeName} -- will retry next cycle`);
+    return;
+  }
+  try {
+    await newMember.roles.add(role);
+  } catch (err) {
+    console.error(`[tiers] Failed to grant ${badgeName} to ${leaderId}:`, err);
+    return; // leave serverState untouched, same reasoning as above
+  }
+  await recordsCh?.send(`🏆 <@${leaderId}> is the new **${badgeName}** on **${server}**!`).catch(err =>
+    console.error(`[tiers] Failed to post #records for ${badgeName}:`, err));
   serverState.holders[cadence][track] = leaderId;
 }
 

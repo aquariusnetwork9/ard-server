@@ -846,7 +846,10 @@ class Store:
         weight = self._corroboration_weight(cond_id, now, tier)
         published = _auto_publishes(tier, cond) or (weight >= k_req)
         age = now - last_seen
-        recency = max(0.0, 1.0 - age / self._effective_ttl(tier))
+        # Clamped both ends -- age is normally >= 0, but a backward clock step
+        # (NTP correction) between an insert and a subsequent read could make
+        # it negative, which would otherwise report confidence > 1.0.
+        recency = max(0.0, min(1.0, 1.0 - age / self._effective_ttl(tier)))
         strength = 1.0 if _auto_publishes(tier, cond) else min(1.0, weight / max(1, k_req))
         conf = round(strength * recency, 3)
         road_idx = net["_canon2idx"].get(canon)

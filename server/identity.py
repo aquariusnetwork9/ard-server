@@ -191,8 +191,9 @@ class LinkStore:
         code is unknown/already used. Read-only, doesn't touch `verified` --
         lets /link/init's response include it without changing init_link's
         existing (widely tested) return shape."""
-        row = self.db.execute(
-            "SELECT verify_server_id FROM pending_links WHERE code=? AND used=0", (code,)).fetchone()
+        with self._lock:
+            row = self.db.execute(
+                "SELECT verify_server_id FROM pending_links WHERE code=? AND used=0", (code,)).fetchone()
         return row[0] if row else None
 
     # ---- step 1.5: producer proves it holds a live Mojang session for mc_uid ----
@@ -375,9 +376,10 @@ class LinkStore:
             return cur.rowcount > 0
 
     def credit_opt_in_for(self, discord_id, server):
-        row = self.db.execute(
-            "SELECT credit_opt_in FROM identities WHERE discord_id=? AND server=?",
-            (discord_id, server)).fetchone()
+        with self._lock:
+            row = self.db.execute(
+                "SELECT credit_opt_in FROM identities WHERE discord_id=? AND server=?",
+                (discord_id, server)).fetchone()
         return bool(row and row[0])
 
     # ---- moderator actions (SS6.5) ----

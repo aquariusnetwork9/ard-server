@@ -177,6 +177,26 @@ export function radarChannelName(server: string): string {
   return `📡・${SERVER_PREFIX[server]}-radar`;
 }
 
+/** e.g. supervisorRoleName('2b2t.org') -> "2b2t Highway Supervisor" -- shared
+ *  with poller.ts's per-server dispatch-access check (see GLOBAL_DISPATCH_ROLES
+ *  for why Supervisor is checked separately from that list, not folded into it). */
+export function supervisorRoleName(server: string): string {
+  return `${SERVER_PREFIX[server]} Highway Supervisor`;
+}
+
+// Dispatch-access roles that are NOT server-scoped, unlike Highway Supervisor
+// (2b2t Highway Supervisor grants zero standing on 6b6t and vice versa, same as
+// every other per-server rank in this file -- see the module note up top).
+// Highway Inspector (Tier M) and Dispatcher (staff-granted or auto-promoted,
+// see AUTO_DISPATCHER_SURVEY_TIER_INDEX) are both deliberately global: an
+// Inspector's trust and a Dispatcher's earned track record apply everywhere.
+// poller.ts's hasDispatchAccess checks THIS list for "any server," and
+// supervisorRoleName(server) separately for "this specific dispatch entry's
+// server" -- DISPATCH_ACCESS_ROLES below stays a flat list because it only
+// gates channel VISIBILITY (seeing the queue), not claim/complete
+// authorization, so it doesn't need the same per-server precision.
+export const GLOBAL_DISPATCH_ROLES = ['Highway Inspector', DISPATCHER_ROLE];
+
 // Maps the ARD `server` field (from /link/bot-complete's response) to the
 // Discord role /link grants automatically.
 export const SERVER_ROLE: Record<string, string> = {
