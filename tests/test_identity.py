@@ -65,6 +65,56 @@ class LinkStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.complete_link("DEAD-BEEF", "discord-1")
 
+    def test_list_identities_reports_username_uids_and_state(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        self.store.complete_link(code, "discord-1", "SomeName")
+        roster = self.store.list_identities(S1)
+        self.assertEqual(len(roster), 1)
+        row = roster[0]
+        self.assertEqual(row["discordId"], "discord-1")
+        self.assertEqual(row["discordUsername"], "SomeName")
+        self.assertEqual(row["linkedUids"], ["mc-uid-1"])
+        self.assertFalse(row["suspended"])
+        self.assertFalse(row["creditOptIn"])
+
+    def test_list_identities_scoped_per_server(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        self.store.complete_link(code, "discord-1", "SomeName")
+        self.assertEqual(self.store.list_identities(S2), [])
+
+    def test_list_identities_without_a_username_is_none(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        self.store.complete_link(code, "discord-1")
+        self.assertIsNone(self.store.list_identities(S1)[0]["discordUsername"])
+
+    def test_list_identities_username_refreshes_on_relink(self):
+        c1 = self.store.init_link("mc-uid-1", S1)
+        self.store.complete_link(c1, "discord-1", "OldName")
+        c2 = self.store.init_link("mc-uid-2", S1)
+        self.store.complete_link(c2, "discord-1", "NewName")
+        roster = self.store.list_identities(S1)
+        self.assertEqual(roster[0]["discordUsername"], "NewName")
+        self.assertCountEqual(roster[0]["linkedUids"], ["mc-uid-1", "mc-uid-2"])
+
+    def test_set_discord_username_backfills_a_pre_existing_identity(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        self.store.complete_link(code, "discord-1")  # no username, as if linked pre-backfill
+        self.assertTrue(self.store.set_discord_username("discord-1", S1, "BackfilledName"))
+        self.assertEqual(self.store.list_identities(S1)[0]["discordUsername"], "BackfilledName")
+
+    def test_set_discord_username_unknown_identity_is_a_noop(self):
+        self.assertFalse(self.store.set_discord_username("discord-nobody", S1, "Name"))
+
+    def test_set_discord_username_rejects_empty_name(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        self.store.complete_link(code, "discord-1")
+        self.assertFalse(self.store.set_discord_username("discord-1", S1, ""))
+
+    def test_set_discord_username_scoped_per_server(self):
+        code = self.store.init_link("mc-uid-1", S1)
+        self.store.complete_link(code, "discord-1")
+        self.assertFalse(self.store.set_discord_username("discord-1", S2, "Name"))
+
     def test_init_link_requires_server(self):
         with self.assertRaises(ValueError):
             self.store.init_link("mc-uid-1", "")
@@ -244,11 +294,12 @@ class DiscordExchangeTests(unittest.TestCase):
     @patch("identity.urllib.request.urlopen")
     def test_every_outbound_request_carries_a_real_user_agent(self, mock_urlopen):
         mock_urlopen.side_effect = [_mock_response({"access_token": "AT"}),
-                                     _mock_response({"id": "discord-123"})]
+                                     _mock_response({"id": "discord-123", "username": "someuser",
+                                                     "global_name": "Some User"})]
 
         result = identity.discord_exchange("CID", "CSECRET", "https://example.test/link.html", "CODE")
 
-        self.assertEqual(result, "discord-123")
+        self.assertEqual(result, ("discord-123", "Some User"))
         self.assertEqual(mock_urlopen.call_count, 2)
         for call in mock_urlopen.call_args_list:
             req = call.args[0]
@@ -262,6 +313,13 @@ class DiscordExchangeTests(unittest.TestCase):
             "https://discord.com/api/oauth2/token", 403, "Forbidden", {}, io.BytesIO(b"error code: 1010"))
         with self.assertRaises(identity.DiscordOAuthError):
             identity.discord_exchange("CID", "CSECRET", "https://example.test/link.html", "CODE")
+
+    @patch("identity.urllib.request.urlopen")
+    def test_falls_back_to_username_without_a_global_name(self, mock_urlopen):
+        mock_urlopen.side_effect = [_mock_response({"access_token": "AT"}),
+                                     _mock_response({"id": "discord-123", "username": "someuser"})]
+        result = identity.discord_exchange("CID", "CSECRET", "https://example.test/link.html", "CODE")
+        self.assertEqual(result, ("discord-123", "someuser"))
 
     @patch("identity.urllib.request.urlopen")
     def test_missing_access_token_is_rejected(self, mock_urlopen):

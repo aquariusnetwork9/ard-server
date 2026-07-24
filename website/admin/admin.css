@@ -126,6 +126,7 @@
 .a-item .a-tag.admin, .a-item .a-tag.full { color: var(--acc); border-color: var(--acc-dim); }
 .a-item .a-tag.moderator, .a-item .a-tag.off_y120 { color: var(--info); border-color: var(--info-dim); }
 .a-item .a-tag.maintainer, .a-item .a-tag.reopen { color: var(--warn); border-color: var(--warn-dim); }
+.a-item .a-tag.suspended { color: var(--crash); border-color: var(--crash-dim); }
 
 /* buttons */
 .btn {

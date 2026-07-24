@@ -1282,6 +1282,8 @@ _CREDITS_LEADERBOARD_RE = re.compile(r"^/credits/([^/]+)/leaderboard$")
 _CONDITIONS_ALL_RE = re.compile(r"^/conditions/([^/]+)/all$")
 _REGISTRY_ID_RE = re.compile(r"^/registry/([0-9a-f]{16})$")
 _IDENTITY_ACTION_RE = re.compile(r"^/identity/([^/]+)/([^/]+)/(suspend|reinstate)$")
+_IDENTITIES_LIST_RE = re.compile(r"^/identities/([^/]+)$")
+_IDENTITIES_BACKFILL_RE = re.compile(r"^/identities/([^/]+)/names$")
 _ADMIN_GRANT_ID_RE = re.compile(r"^/admin/grants/([0-9a-f]{16})$")
 _SESSION_COOKIE_NAME = "ard_session"
 
@@ -1394,6 +1396,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._registry_list()
         if path == "/link/config":
             return self._link_config()
+        m = _IDENTITIES_LIST_RE.match(path)
+        if m:
+            return self._identities_list(m.group(1))
         if path == "/admin/session":
             return self._admin_session()
         if path == "/admin/grants":
@@ -1430,6 +1435,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._link_bot_complete()
         if path == "/link/credit-opt-in":
             return self._link_credit_opt_in()
+        m = _IDENTITIES_BACKFILL_RE.match(path)
+        if m:
+            return self._identities_backfill_names(m.group(1))
         m = _IDENTITY_ACTION_RE.match(path)
         if m:
             return self._identity_action(m.group(1), m.group(2), m.group(3))
@@ -2008,11 +2016,11 @@ class Handler(BaseHTTPRequestHandler):
         if not link_code or not discord_code:
             return self._json(400, {"error": "linkCode and discordCode required"})
         try:
-            discord_id = self.app.discord_verify(discord_code)
+            discord_id, discord_username = self.app.discord_verify(discord_code)
         except identity.DiscordOAuthError as e:
             return self._json(400, {"error": f"Discord verification failed: {e}"})
         try:
-            token_id, token = self.app.auth.links.complete_link(link_code, discord_id)
+            token_id, token = self.app.auth.links.complete_link(link_code, discord_id, discord_username)
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         self._json(200, {"tokenId": token_id, "token": token,
@@ -2040,13 +2048,18 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             return self._json(400, {"error": "bad json"})
         link_code, discord_id = body.get("linkCode"), body.get("discordId")
+        # Optional: the bot already has the caller's Discord username/display name
+        # from the same interaction it read discordId off of, so passing it along
+        # costs it nothing and lets the admin roster show a name instead of a bare
+        # snowflake. Purely cosmetic -- omitting it just leaves the name unknown.
+        discord_username = body.get("discordUsername")
         if not link_code or not discord_id:
             return self._json(400, {"error": "linkCode and discordId required"})
         server = self.app.auth.links.peek_pending_server(link_code)
         if server is None:
             return self._json(400, {"error": "unknown or expired link code"})
         try:
-            token_id, token = self.app.auth.links.complete_link(link_code, discord_id)
+            token_id, token = self.app.auth.links.complete_link(link_code, discord_id, discord_username)
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         self._json(200, {"tokenId": token_id, "token": token, "server": server,
@@ -2101,6 +2114,47 @@ class Handler(BaseHTTPRequestHandler):
             else self.app.store.repair_leaderboard(server, since=since)
         self._json(200, {"server": server, "kind": kind, "leaderboard": rows})
 
+    def _identities_list(self, server):
+        # Moderator/admin (same gate as the suspend/reinstate actions this feeds),
+        # OR the bot -- it needs to read this roster itself to know which
+        # identities are still missing a discordUsername before it can resolve and
+        # backfill them (see _identities_backfill_names below).
+        scopes = self._caller_scopes(server)
+        is_mod = self.app.auth.is_owner(self._token()) or \
+            trust.SCOPE_MODERATOR in scopes or trust.SCOPE_ADMIN in scopes
+        if not (is_mod or self.app.auth.is_bot(self._token())):
+            return self._json(403, {"error": "moderator/admin scope or the bot credential "
+                                              "is required for this server"})
+        if self.app.auth.links is None:
+            return self._json(503, {"error": "account linking not configured"})
+        self._json(200, {"identities": self.app.auth.links.list_identities(server)})
+
+    def _identities_backfill_names(self, server):
+        # Bot-only: it's the only holder of a real Discord bot token, so it's the
+        # only thing that can actually resolve a bare discord_id into a display
+        # name outside the OAuth flow (which is user-scoped -- it can only ever
+        # learn the name of whoever is completing that exact link). This exists
+        # purely to backfill identities that linked before username capture
+        # existed; complete_link's own username refresh covers everything from
+        # here on. Never creates identities, only fills in a name for ones that
+        # already exist -- see LinkStore.set_discord_username.
+        if not self.app.auth.is_bot(self._token()):
+            return self._json(401, {"error": "bot credential required"})
+        if self.app.auth.links is None:
+            return self._json(503, {"error": "account linking not configured"})
+        try:
+            raw = self._read_body()
+            body = json.loads(raw) if raw else {}
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "bad json"})
+        names = body.get("names")
+        if not isinstance(names, dict):
+            return self._json(400, {"error": "names (object of discordId -> username) required"})
+        updated = sum(
+            1 for discord_id, username in names.items()
+            if self.app.auth.links.set_discord_username(discord_id, server, username))
+        self._json(200, {"updated": updated})
+
     def _identity_action(self, server, discord_id, action):
         if not self._require_moderator_for(server):
             return
@@ -2135,7 +2189,7 @@ class Handler(BaseHTTPRequestHandler):
         if not discord_code:
             return self._json(400, {"error": "discordCode required"})
         try:
-            discord_id = self.app.discord_verify(discord_code)
+            discord_id, _discord_username = self.app.discord_verify(discord_code)
         except identity.DiscordOAuthError as e:
             return self._json(400, {"error": f"Discord verification failed: {e}"})
         grants = self.app.auth.registry.grants_for_discord(discord_id)

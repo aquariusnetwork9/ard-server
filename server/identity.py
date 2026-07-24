@@ -87,7 +87,7 @@ class LinkStore:
         CREATE TABLE IF NOT EXISTS identities(
           discord_id TEXT NOT NULL, server TEXT NOT NULL, created_at REAL NOT NULL,
           suspended INTEGER NOT NULL DEFAULT 0, suspended_at REAL,
-          credit_opt_in INTEGER NOT NULL DEFAULT 0,
+          credit_opt_in INTEGER NOT NULL DEFAULT 0, discord_username TEXT,
           PRIMARY KEY(discord_id, server)
         );
         CREATE TABLE IF NOT EXISTS linked_uids(
@@ -124,7 +124,7 @@ class LinkStore:
             CREATE TABLE identities(
               discord_id TEXT NOT NULL, server TEXT NOT NULL, created_at REAL NOT NULL,
               suspended INTEGER NOT NULL DEFAULT 0, suspended_at REAL,
-              credit_opt_in INTEGER NOT NULL DEFAULT 0,
+              credit_opt_in INTEGER NOT NULL DEFAULT 0, discord_username TEXT,
               PRIMARY KEY(discord_id, server)
             );
             INSERT INTO identities(discord_id, server, created_at, suspended, suspended_at)
@@ -135,6 +135,13 @@ class LinkStore:
             cols = {r[1] for r in self.db.execute("PRAGMA table_info(identities)").fetchall()}
         if "credit_opt_in" not in cols:
             self.db.execute("ALTER TABLE identities ADD COLUMN credit_opt_in INTEGER NOT NULL DEFAULT 0")
+            self.db.commit()
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(identities)").fetchall()}
+        if "discord_username" not in cols:
+            # Backfilled NULL for anyone who linked before this existed -- their
+            # display name is simply unknown until they touch a flow that re-resolves
+            # it (any future /link/complete or /link/bot-complete for that identity).
+            self.db.execute("ALTER TABLE identities ADD COLUMN discord_username TEXT")
             self.db.commit()
 
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(linked_uids)").fetchall()}
@@ -236,14 +243,20 @@ class LinkStore:
         return server
 
     # ---- step 2: Discord-authenticated website/session resolves the code ----
-    def complete_link(self, code, discord_id):
+    def complete_link(self, code, discord_id, discord_username=None):
         """Consumes the pending code and mints a fresh Tier B bearer token for its
         mc_uid, linked to discord_id, ON THE SERVER RECORDED AT /link/init TIME
         (not re-supplied here -- the browser-side completion step never needs to
         know or choose it). Returns (token_id, token). Raises ValueError on an
         unknown/expired/already-used code, a not-yet-ownership-verified code (when
         require_ownership_proof is on), a suspended identity, or hitting
-        max_linked_uids for that server."""
+        max_linked_uids for that server.
+
+        discord_username, when the caller has one on hand (a real OAuth exchange
+        always does; the bot-mediated path only if the bot passes one along), is
+        stored purely for admin-dashboard display -- it's never a security check,
+        so a stale or missing name never blocks a link. Always overwritten with
+        the freshest value seen, since a Discord username can change."""
         now = self.clock()
         with self._lock:
             row = self.db.execute(
@@ -274,6 +287,10 @@ class LinkStore:
             self.db.execute(
                 "INSERT INTO identities(discord_id,server,created_at) VALUES(?,?,?)"
                 " ON CONFLICT(discord_id,server) DO NOTHING", (discord_id, server, now))
+            if discord_username:
+                self.db.execute(
+                    "UPDATE identities SET discord_username=? WHERE discord_id=? AND server=?",
+                    (discord_username, discord_id, server))
             suspended = self.db.execute(
                 "SELECT suspended FROM identities WHERE discord_id=? AND server=?",
                 (discord_id, server)).fetchone()[0]
@@ -383,6 +400,53 @@ class LinkStore:
             self.db.commit()
             return cur.rowcount > 0
 
+    def set_discord_username(self, discord_id, server, username):
+        """Best-effort display-name backfill for an identity that already exists,
+        independent of any link event -- used by the bot's one-off migration
+        script to resolve names for accounts that linked before username capture
+        existed (complete_link only ever refreshes the name of the identity IT'S
+        currently linking, so it can't reach these). Never creates a row and never
+        writes an empty name; returns whether a matching identity was found."""
+        if not username:
+            return False
+        with self._lock:
+            cur = self.db.execute(
+                "UPDATE identities SET discord_username=? WHERE discord_id=? AND server=?",
+                (username, discord_id, server))
+            self.db.commit()
+            return cur.rowcount > 0
+
+    # ---- admin dashboard: the roster itself (SS6.2) ----
+    def list_identities(self, server):
+        """Every linked Discord identity on this server -- discord_id, best-known
+        display name, every currently-linked (non-revoked) mc_uid, link date, and
+        suspended/credit-opt-in state. Until now nothing could answer "who's
+        linked" as a set -- every other read here (discord_identity_for, mc_uid_for,
+        credit_opt_in_for) resolves exactly one known id/token; this is the one
+        list view, so it's the only place the admin dashboard can build a roster
+        panel from."""
+        with self._lock:
+            identities = self.db.execute(
+                "SELECT discord_id, discord_username, created_at, suspended, credit_opt_in"
+                " FROM identities WHERE server=? ORDER BY created_at DESC", (server,)).fetchall()
+            uid_rows = self.db.execute(
+                "SELECT discord_id, mc_uid FROM linked_uids WHERE server=? AND revoked=0",
+                (server,)).fetchall()
+        uids_by_identity = {}
+        for discord_id, mc_uid in uid_rows:
+            uids_by_identity.setdefault(discord_id, []).append(mc_uid)
+        return [
+            {
+                "discordId": discord_id,
+                "discordUsername": discord_username,
+                "linkedUids": uids_by_identity.get(discord_id, []),
+                "linkedAt": created_at,
+                "suspended": bool(suspended),
+                "creditOptIn": bool(credit_opt_in),
+            }
+            for discord_id, discord_username, created_at, suspended, credit_opt_in in identities
+        ]
+
 
 # --------------------------------------------------------------------------- Discord OAuth
 
@@ -404,6 +468,13 @@ def discord_exchange(client_id, client_secret, redirect_uri, discord_code, timeo
     a one-time `discord_code` (from Discord's redirect after the user logs in) for
     that user's Discord ID via /oauth2/token then /users/@me. No dependency beyond
     the stdlib, matching the rest of this service.
+
+    Returns (discord_id, display_name). display_name prefers the modern "global_name"
+    (the display name Discord shows everywhere post-username-migration) and falls
+    back to the classic "username" field if a user has never set one -- it's a
+    display convenience only, never used for corroboration or dedup (discord_id
+    alone is the identity), so an unusual/missing value here can never weaken Tier
+    B's guarantees.
 
     Until Phase 3 (the dedicated map website) exists, the ingest server itself is
     the thing calling this -- a minimal static "log in with Discord" link pointing
@@ -438,7 +509,8 @@ def discord_exchange(client_id, client_secret, redirect_uri, discord_code, timeo
     discord_id = user_resp.get("id")
     if not discord_id:
         raise DiscordOAuthError("no id in Discord's user profile response")
-    return discord_id
+    display_name = user_resp.get("global_name") or user_resp.get("username")
+    return discord_id, display_name
 
 
 class MojangVerifyError(Exception):

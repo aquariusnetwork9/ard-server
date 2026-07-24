@@ -43,7 +43,8 @@ FAKE_DISCORD_CODES = {"good-code-1": "discord-user-1", "good-code-2": "discord-u
 def fake_discord_verify(discord_code):
     if discord_code not in FAKE_DISCORD_CODES:
         raise identity.DiscordOAuthError("unrecognized code")
-    return FAKE_DISCORD_CODES[discord_code]
+    discord_id = FAKE_DISCORD_CODES[discord_code]
+    return discord_id, f"name-{discord_id}"
 
 
 def req(method, url, token=None, body=None, cookie=None, extra_headers=None):
@@ -108,7 +109,8 @@ class HttpTests(unittest.TestCase):
         # token) -- what /admin/login resolves into a session for.
         registry.grant_to_discord("discord-admin-1", trust.SCOPE_ADMIN, SERVER, "test-owner")
         registry.grant_to_discord("discord-mod-1", trust.SCOPE_MODERATOR, SERVER, "test-owner")
-        auth = Auth(registry, links=links, owner_hashes={Auth.hash_token(OWNER_TOKEN)}, sessions=sess)
+        auth = Auth(registry, links=links, owner_hashes={Auth.hash_token(OWNER_TOKEN)}, sessions=sess,
+                    bot_hashes={Auth.hash_token(BOT_TOKEN)})
         cls.registry = registry
         cls.links = links
         cls.sessions = sess
@@ -460,6 +462,66 @@ class HttpTests(unittest.TestCase):
         # MODERATOR_TOKEN is scoped to SERVER only -- no standing over SERVER2.
         self.assertEqual(
             req("POST", self.url(f"/identity/{SERVER2}/discord-user-1/suspend"), token=MODERATOR_TOKEN)[0], 403)
+
+    def test_identities_list_requires_moderator(self):
+        self.assertEqual(req("GET", self.url(f"/identities/{SERVER}"), token=FULL_TOKEN)[0], 403)
+        self.assertEqual(req("GET", self.url(f"/identities/{SERVER}"), token=NOBODY_TOKEN)[0], 403)
+
+    def test_identities_list_shows_the_linked_roster_with_names(self):
+        # Dedicated identity/UID so this doesn't collide with other tests sharing
+        # this class's Store -- good-code-2 -> discord-user-2.
+        _, init_body = req("POST", self.url("/link/init"),
+                            body={"mcUid": "mc-uid-roster-1", "server": SERVER})
+        req("POST", self.url("/link/complete"),
+            body={"linkCode": init_body["code"], "discordCode": "good-code-2"})
+
+        code, body = req("GET", self.url(f"/identities/{SERVER}"), token=MODERATOR_TOKEN)
+        self.assertEqual(code, 200)
+        row = next(r for r in body["identities"] if r["discordId"] == "discord-user-2")
+        self.assertEqual(row["discordUsername"], "name-discord-user-2")
+        self.assertIn("mc-uid-roster-1", row["linkedUids"])
+        self.assertFalse(row["suspended"])
+
+    def test_identities_list_is_scoped_to_its_own_server(self):
+        code, body = req("GET", self.url(f"/identities/{SERVER2}"), token=MODERATOR_TOKEN)
+        self.assertEqual(code, 403, "MODERATOR_TOKEN has no standing on SERVER2")
+
+    def test_identities_list_also_readable_by_the_bot(self):
+        # The bot needs to read the roster itself to know which identities are
+        # still missing a name before it can resolve and backfill them.
+        code, _ = req("GET", self.url(f"/identities/{SERVER}"), token=BOT_TOKEN)
+        self.assertEqual(code, 200)
+
+    def test_identities_backfill_names_requires_bot_credential(self):
+        self.assertEqual(
+            req("POST", self.url(f"/identities/{SERVER}/names"), token=MODERATOR_TOKEN,
+                body={"names": {"discord-user-1": "SomeName"}})[0], 401)
+        self.assertEqual(
+            req("POST", self.url(f"/identities/{SERVER}/names"), token=OWNER_TOKEN,
+                body={"names": {"discord-user-1": "SomeName"}})[0], 401)
+
+    def test_identities_backfill_names_fills_in_missing_names(self):
+        # Linked directly against the LinkStore (bypassing HTTP/OAuth entirely,
+        # same as a real pre-username-capture link would have been) so this
+        # identity genuinely starts with no discordUsername -- every code this
+        # class's fake_discord_verify knows about already resolves one.
+        code = self.links.init_link("mc-uid-backfill-1", SERVER)
+        self.links.complete_link(code, "discord-user-prebackfill")
+
+        status, body = req("POST", self.url(f"/identities/{SERVER}/names"), token=BOT_TOKEN,
+                            body={"names": {"discord-user-prebackfill": "BackfilledName",
+                                            "discord-nobody": "X"}})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["updated"], 1, "only the identity that actually exists counts")
+
+        _, roster = req("GET", self.url(f"/identities/{SERVER}"), token=MODERATOR_TOKEN)
+        row = next(r for r in roster["identities"] if r["discordId"] == "discord-user-prebackfill")
+        self.assertEqual(row["discordUsername"], "BackfilledName")
+
+    def test_identities_backfill_names_rejects_bad_shape(self):
+        code, _ = req("POST", self.url(f"/identities/{SERVER}/names"), token=BOT_TOKEN,
+                       body={"names": "not-an-object"})
+        self.assertEqual(code, 400)
 
     def test_moderator_suspend_demotes_tier_b_to_anonymous(self):
         # Dedicated identity (good-code-3), never touched by other tests -- suspend

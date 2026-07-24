@@ -16,7 +16,7 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
 
   let result;
   try {
-    result = await completeLink(code, interaction.user.id);
+    result = await completeLink(code, interaction.user.id, interaction.user.displayName);
   } catch (e) {
     const message = e instanceof ArdLinkError ? e.message : 'Could not reach the ARD server -- try again shortly.';
     await interaction.editReply(`Link failed: ${message}`);

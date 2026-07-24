@@ -144,10 +144,11 @@
     var isMod = scopes.has("moderator") || isAdmin;
     $("server-scope-badge").textContent = Array.from(scopes).join(", ") || "no scope";
     $("panel-moderation").classList.toggle("hidden", !isMod);
+    $("panel-identities").classList.toggle("hidden", !isMod);
     $("panel-identity").classList.toggle("hidden", !isMod);
     $("panel-registry").classList.toggle("hidden", !isAdmin);
     $("panel-grants").classList.toggle("hidden", !isAdmin);
-    if (isMod) loadModeration(server);
+    if (isMod) { loadModeration(server); loadIdentities(server); }
     if (isAdmin) { loadRegistry(server); loadGrants(server); }
   }
 
@@ -305,15 +306,69 @@
     });
   });
 
-  // ---- identity suspend/reinstate ----
+  // ---- linked identities roster ----
+  function fmtDate(unixSeconds) {
+    if (!unixSeconds) return "unknown date";
+    try { return new Date(unixSeconds * 1000).toLocaleDateString(); } catch (e) { return "unknown date"; }
+  }
+
+  function runIdentityAction(server, discordId, action, onDone) {
+    api("/identity/" + encodeURIComponent(server) + "/" + encodeURIComponent(discordId) + "/" + action,
+      { method: "POST" }).then(function (res) {
+      toast(res.ok ? (action + "d") : (res.body.error || "failed"), !res.ok);
+      if (res.ok && onDone) onDone();
+    });
+  }
+
+  function loadIdentities(server) {
+    api("/identities/" + encodeURIComponent(server)).then(function (res) {
+      var el = $("identities-list");
+      if (!res.ok) { el.textContent = res.body.error || "couldn't load"; return; }
+      var identities = res.body.identities || [];
+      $("identities-count").textContent = identities.length;
+      el.innerHTML = "";
+      if (!identities.length) { el.innerHTML = "<div class=\"a-empty\">No linked Discord accounts on this server yet.</div>"; return; }
+      identities.forEach(function (id) {
+        // Falls back to the bare snowflake when a display name was never captured
+        // (identities linked before this existed, or via the bot path without one).
+        var name = id.discordUsername || id.discordId;
+        var uidCount = (id.linkedUids || []).length;
+        var sub = id.discordId + " · " + uidCount + " UID" + (uidCount === 1 ? "" : "s")
+          + " linked · since " + fmtDate(id.linkedAt) + (id.creditOptIn ? " · credit opt-in" : "");
+        var row = itemRow("👤", name, sub, id.suspended ? "suspended" : "");
+        var actions = document.createElement("div");
+        actions.className = "a-actions";
+        if (id.suspended) {
+          var reinstate = document.createElement("button");
+          reinstate.className = "btn go small";
+          reinstate.textContent = "Reinstate";
+          reinstate.onclick = function () {
+            runIdentityAction(server, id.discordId, "reinstate", function () { loadIdentities(server); });
+          };
+          actions.appendChild(reinstate);
+        } else {
+          var suspend = document.createElement("button");
+          suspend.className = "btn warn small";
+          suspend.textContent = "Suspend";
+          suspend.onclick = function () {
+            runIdentityAction(server, id.discordId, "suspend", function () { loadIdentities(server); });
+          };
+          actions.appendChild(suspend);
+        }
+        row.appendChild(actions);
+        el.appendChild(row);
+      });
+    });
+  }
+
+  // ---- identity suspend/reinstate (manual, by ID -- e.g. acting on a report
+  // you're investigating that names an ID not yet visible in the roster above) ----
   function identityAction(action) {
     var server = $("server-tabs").value;
     var discordId = $("identity-discord-id").value.trim();
     if (!discordId) return;
-    api("/identity/" + encodeURIComponent(server) + "/" + encodeURIComponent(discordId) + "/" + action,
-      { method: "POST" }).then(function (res) {
-      $("identity-result").textContent = res.ok ? (action + "d") : (res.body.error || "failed");
-    });
+    runIdentityAction(server, discordId, action, function () { loadIdentities(server); });
+    $("identity-result").textContent = "";
   }
   $("identity-suspend-btn").addEventListener("click", function () { identityAction("suspend"); });
   $("identity-reinstate-btn").addEventListener("click", function () { identityAction("reinstate"); });

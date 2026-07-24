@@ -14,14 +14,16 @@ export interface CompleteLinkResult {
  * instead of a Discord OAuth code, since discordId is already Discord-verified
  * (it comes straight off the slash-command interaction).
  */
-export async function completeLink(linkCode: string, discordId: string): Promise<CompleteLinkResult> {
+export async function completeLink(
+  linkCode: string, discordId: string, discordUsername?: string
+): Promise<CompleteLinkResult> {
   const resp = await fetch(`${config.ard.baseUrl}/link/bot-complete`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: config.ard.botSecret,
     },
-    body: JSON.stringify({ linkCode, discordId }),
+    body: JSON.stringify({ linkCode, discordId, discordUsername }),
   });
   const body: any = await resp.json().catch(() => ({}));
   if (!resp.ok) {
@@ -182,4 +184,32 @@ export interface ConditionEntry {
 export async function getAllConditions(server: string): Promise<ConditionEntry[]> {
   const body = await ardRequest(`/conditions/${server}/all`, 'GET');
   return (body.conditions ?? []) as ConditionEntry[];
+}
+
+export interface LinkedIdentity {
+  discordId: string;
+  discordUsername: string | null;
+  linkedUids: string[];
+  linkedAt: number;
+  suspended: boolean;
+  creditOptIn: boolean;
+}
+
+/** GET /identities/<server> -- the bot-readable roster of every linked Discord
+ *  identity on this server, used by scripts/backfill-discord-names.ts to find
+ *  identities still missing a discordUsername (anyone linked before that field
+ *  existed). Admins get the same data via the dashboard's own session auth. */
+export async function listIdentities(server: string): Promise<LinkedIdentity[]> {
+  const body = await ardRequest(`/identities/${server}`, 'GET');
+  return (body.identities ?? []) as LinkedIdentity[];
+}
+
+/** POST /identities/<server>/names -- backfills discordUsername for identities
+ *  that already exist, keyed by discordId. Only the bot can call this: it's the
+ *  only thing holding a real Discord bot token, so it's the only thing that can
+ *  resolve a bare id into a name outside the OAuth link flow. Returns how many
+ *  of the supplied ids actually matched an existing identity. */
+export async function backfillNames(server: string, names: Record<string, string>): Promise<number> {
+  const body = await ardRequest(`/identities/${server}/names`, 'POST', { names });
+  return (body.updated ?? 0) as number;
 }
