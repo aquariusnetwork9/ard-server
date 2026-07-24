@@ -215,7 +215,7 @@ export const CATEGORIES: CategorySpec[] = [
     channels: [
       { name: '🛑・rules', topic: 'Read before posting anywhere else.', key: 'rules', oldNames: ['rules'] },
       { name: '📢・announcements', topic: 'Network status + community news.', key: 'announcements', oldNames: ['announcements'] },
-      { name: '🪪・verify-here', topic: 'Run /link <code> here to link your Minecraft account and become a Highway Worker.', key: 'verify-here', oldNames: ['verify-here'] },
+      { name: '🪪・register', topic: 'Run /link <code> here to link your Minecraft account and become a Highway Worker.', key: 'verify-here', oldNames: ['🪪・verify-here', 'verify-here'] },
       { name: '❓・faq', topic: 'Read-only -- answers to common questions.', key: 'faq', readOnly: true },
     ],
   },

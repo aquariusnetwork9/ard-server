@@ -8,7 +8,7 @@ import { EmbedBuilder } from 'discord.js';
  * reference doc, not a chat channel.
  */
 export function buildFaqEmbed(verifyChannelId?: string): EmbedBuilder {
-  const verifyRef = verifyChannelId ? `<#${verifyChannelId}>` : '#verify-here';
+  const verifyRef = verifyChannelId ? `<#${verifyChannelId}>` : '#register';
   return new EmbedBuilder()
     .setTitle('Frequently Asked Questions')
     .setColor(0x5865f2)

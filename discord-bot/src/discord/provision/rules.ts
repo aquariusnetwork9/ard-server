@@ -8,7 +8,7 @@ import { EmbedBuilder } from 'discord.js';
  * generic anti-doxxing boilerplate line.
  */
 export function buildRulesEmbed(verifyChannelId?: string): EmbedBuilder {
-  const verifyRef = verifyChannelId ? `<#${verifyChannelId}>` : '#verify-here';
+  const verifyRef = verifyChannelId ? `<#${verifyChannelId}>` : '#register';
   return new EmbedBuilder()
     .setTitle('Aquarius Road Dept -- Server Rules')
     .setColor(0x3ddc97)
