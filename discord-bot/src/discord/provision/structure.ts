@@ -36,6 +36,10 @@ export interface RoleSpec {
 
 export const TRAVELER_ROLE = 'Traveler';
 
+// Shared with tiers.ts's auto-promotion job (see AUTO_DISPATCHER_SURVEY_TIER_INDEX
+// below) and DISPATCH_ACCESS_ROLES -- one name so the two can never drift apart.
+export const DISPATCHER_ROLE = 'Dispatcher';
+
 // Bare per-server display prefix (no " Highway Worker" suffix) -- used to build the
 // Survey/Road Crew tier and rotating-badge role names below and the radar channel
 // names further down, none of which are part of the trust-tier role family
@@ -48,13 +52,25 @@ const SERVER_PREFIX: Record<string, string> = {
 // Survey (confirmed hazard reports) and Road Crew (completed dispatch repairs) --
 // cosmetic contribution ladders siloed per server, same as every trust concept in
 // this file. Tiers STACK (every tier earned is kept, never swapped -- see
-// discord/dispatch/tiers.ts) and carry ZERO channel/dispatch privilege of their
-// own: report/repair volume is never conflated with trust. Thresholds are lifetime
-// counts on that one server (ARD's own /credits/<server>/leaderboard is already
-// siloed the same way).
+// discord/dispatch/tiers.ts). Thresholds are lifetime counts on that one server
+// (ARD's own /credits/<server>/leaderboard is already siloed the same way).
+// Both tracks are otherwise report/repair volume, never conflated with trust --
+// EXCEPT the one deliberate exception below (AUTO_DISPATCHER_SURVEY_TIER_INDEX).
 export const SURVEY_TIER_NAMES = ['Survey Tech', 'Surveyor', 'Senior Surveyor', 'Chief Surveyor'];
 export const CREW_TIER_NAMES = ['Crew Member', 'Crew Leader', 'Foreman', 'Superintendent'];
 export const TIER_THRESHOLDS = [50, 100, 250, 500];
+
+// Auto-grants the Dispatcher role (dispatch claim/complete access, see
+// DISPATCH_ACCESS_ROLES + tiers.ts's syncTierRoles) the first time a linked
+// identity crosses this index into SURVEY_TIER_NAMES/TIER_THRESHOLDS, on ANY
+// one server -- a real track record of consistent good-faith reporting
+// substitutes for a staff member hand-picking every Dispatcher, without
+// dropping the bar all the way to "just linked" (see the design discussion
+// this came out of). Deliberately the SURVEY track only, never Crew: Crew
+// credit itself comes from completed dispatch work, which requires Dispatcher
+// access in the first place -- gating on it here would be circular. Stacks
+// like every other tier here: once granted, never revoked by this job.
+export const AUTO_DISPATCHER_SURVEY_TIER_INDEX = 1; // 'Surveyor'
 
 const SURVEY_TIER_COLORS = [0x74b9ff, 0x2e86de, 0x1b4f9c, 0x0a2a5e]; // light -> dark blue
 const CREW_TIER_COLORS = [0xffb74d, 0xf57c00, 0x9a5b13, 0x5d3a1a];   // light -> dark amber/brown
@@ -108,19 +124,23 @@ export const ROLES: RoleSpec[] = [
   { name: '2b2t Highway Supervisor', color: 0x1f8b4c, hoist: true },
   { name: '6b6t Highway Supervisor', color: 0x206694, hoist: true },
   { name: 'Highway Inspector', color: 0xf1c40f, hoist: true },
-  // Manual, staff-granted only -- deliberately no self-serve command (see
-  // ard-server PROTOCOL.md SS6.7). A Highway Worker who's earned this can
-  // claim/complete dispatch targets in Dispatch Center; Tier A/M members
-  // never need it themselves (their existing Supervisor/Inspector rank
-  // already grants Dispatch Center access -- see DISPATCH_ACCESS_ROLES).
-  { name: 'Dispatcher', color: 0x11cdef, hoist: true },
+  // Staff-granted OR auto-promoted (see AUTO_DISPATCHER_SURVEY_TIER_INDEX +
+  // tiers.ts's syncTierRoles) -- no self-serve command either way (see ard-
+  // server PROTOCOL.md SS6.7). A Highway Worker who holds this can claim/
+  // complete dispatch targets in Dispatch Center; Tier A/M members never
+  // need it themselves (their existing Supervisor/Inspector rank already
+  // grants Dispatch Center access -- see DISPATCH_ACCESS_ROLES).
+  { name: DISPATCHER_ROLE, color: 0x11cdef, hoist: true },
   { name: 'Highway Patrol', color: 0xed4245, hoist: true, oldNames: ['Moderator'] },
   { name: 'Director', color: 0x9b59b6, hoist: true },
   { name: 'Branch Director', color: 0x71368a, hoist: true },
   // Survey/Road Crew tiers + weekly/monthly rotating badges -- see the generation
   // loop above tierRoleName/rotatingBadgeName. Deliberately absent from every
-  // CategorySpec.visibleTo below: these are pure badges with no channel or
-  // dispatch access of their own.
+  // CategorySpec.visibleTo below: these carry no channel access of their own.
+  // The one deliberate exception is functional, not visibility-based: crossing
+  // the Survey track's AUTO_DISPATCHER_SURVEY_TIER_INDEX auto-grants the
+  // separate Dispatcher role above (see tiers.ts's syncTierRoles) -- these
+  // badge roles themselves still open nothing directly.
   ...GENERATED_CONTRIBUTION_ROLES,
 ];
 

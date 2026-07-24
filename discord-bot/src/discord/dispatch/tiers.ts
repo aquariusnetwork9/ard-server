@@ -1,27 +1,34 @@
 import fs from 'fs';
 import path from 'path';
-import { Client, TextChannel, NewsChannel } from 'discord.js';
+import { Client, Guild, GuildMember, TextChannel, NewsChannel } from 'discord.js';
 import { config } from '../../config';
 import { getLeaderboard } from '../../ard-client';
 import {
-  SERVER_ROLE, DISPATCH_CHANNEL_NAMES, TIER_THRESHOLDS,
-  tierRoleName, rotatingBadgeName, Track, Cadence,
+  SERVER_ROLE, DISPATCH_CHANNEL_NAMES, TIER_THRESHOLDS, DISPATCHER_ROLE,
+  AUTO_DISPATCHER_SURVEY_TIER_INDEX, tierRoleName, rotatingBadgeName, Track, Cadence,
 } from '../provision/structure';
 import { periodKey, periodStartMs } from './periods';
 import { isCurrentSession } from '../../runtime-lock';
 
 /**
- * Two independent jobs, run together on one long-interval timer (ranks don't
+ * Three independent jobs, run together on one long-interval timer (ranks don't
  * need dispatch-queue freshness):
  *  1. Tier-role sync -- recomputes each member's lifetime Survey/Road Crew
  *     counts and grants any newly-crossed tier role. STACKING: only ever
  *     adds a role, never removes one already earned.
- *  2. Weekly/monthly rotating badge -- on a period rollover, recomputes that
+ *  2. Auto-Dispatcher promotion -- piggybacks on the same Survey-track counts:
+ *     once a linked identity crosses AUTO_DISPATCHER_SURVEY_TIER_INDEX on ANY
+ *     one server, grants the (otherwise staff-only) Dispatcher role. See
+ *     structure.ts's own note on this for why it's Survey-only, never Crew.
+ *  3. Weekly/monthly rotating badge -- on a period rollover, recomputes that
  *     period's leader per track and moves the single rotating badge role to
  *     them, stripping it from whoever held it before.
  *
  * Both tracks are siloed per server, same as everywhere else in this project
  * (see structure.ts's own note on this) -- there is no cross-server ladder.
+ * The Dispatcher role itself is the one exception: it's global (dispatch's
+ * open/barracks/closed/records queue isn't split per server), so crossing the
+ * threshold on either server is enough to earn it.
  */
 
 const STATE_PATH = path.join(process.cwd(), 'tiers-state.json');
@@ -81,7 +88,26 @@ async function syncTierRoles(
       await member.roles.add(role).catch(() => {});
       await recordsCh?.send(`🎉 <@${entry.discordId}> just made **${roleName}** on **${server}**!`).catch(() => {});
     }
+    // Checked every cycle regardless of whether a tier role was newly granted
+    // just above -- self-healing, same as the rest of this job: a member who
+    // crossed the threshold before this feature existed still gets backfilled.
+    if (track === 'survey' && entry.count >= TIER_THRESHOLDS[AUTO_DISPATCHER_SURVEY_TIER_INDEX]) {
+      await grantAutoDispatcher(guild, member, entry.discordId, server, recordsCh);
+    }
   }
+}
+
+async function grantAutoDispatcher(
+  guild: Guild, member: GuildMember, discordId: string, server: string,
+  recordsCh: TextChannel | NewsChannel | null,
+): Promise<void> {
+  const role = guild.roles.cache.find(r => r.name === DISPATCHER_ROLE);
+  if (!role) return; // /setup hasn't provisioned this role yet
+  if (member.roles.cache.has(role.id)) return; // already a Dispatcher (auto or staff-granted) -- no re-announce
+  await member.roles.add(role).catch(() => {});
+  await recordsCh?.send(
+    `🚦 <@${discordId}> auto-promoted to **Dispatcher** -- reached **${tierRoleName(server, 'survey', AUTO_DISPATCHER_SURVEY_TIER_INDEX)}** on **${server}**, can now claim/complete repairs!`
+  ).catch(() => {});
 }
 
 async function rotateBadge(
