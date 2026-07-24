@@ -890,6 +890,16 @@ class Store:
         # isn't excluded before _row_view even sees its real tier; the PRECISE
         # per-tier cutoff is re-checked per row just below, using _effective_ttl.
         widest_ttl = self._widest_ttl()
+        out = []
+        # The whole per-row loop shares this connection with every other
+        # request thread -- _row_view/_active_clear below execute their own
+        # queries, so the lock has to stay held for all of it, not just the
+        # initial SELECT. A lock that released before this loop let a
+        # concurrent write interleave with these reads and corrupt the shared
+        # cursor state (observed live as sporadic "sqlite3.InterfaceError: bad
+        # parameter or other API misuse" -- the exact same class of bug
+        # ingest() had, just on the read side, and this path is hit far more
+        # often).
         with self._lock:
             q = ("SELECT id,server,road_canon,seg,along,cond,tier,reports,first_seen,last_seen,"
                  "lane_min,lane_max,visible_at,public_delay_extra FROM conditions"
@@ -899,50 +909,49 @@ class Store:
                 q += " AND road_canon=?"
                 args.append(canon_filter)
             rows = self.db.execute(q, args).fetchall()
-        out = []
-        for r in rows:
-            canon, raw_last_seen = r[2], r[9]
-            v = self._row_view(net, r, now)
-            if now - raw_last_seen > self._effective_ttl(v["tier"]):
-                continue  # past this tier's own decay window (TIER_TTL_OVERRIDE)
-            # Reveal delay (REVEAL_DELAY_RANGE, + PUBLIC_EXTRA_DELAY_RANGE for
-            # public=True): gates EVERY external read path alike -- the public
-            # feed and the bot/moderator-only /all feed both go through query(),
-            # so neither gets early visibility. Both flags popped rather than
-            # left in the dict since every row that survives this is trivially
-            # True for whichever gate(s) applied -- a constant, meaningless
-            # field on the wire.
-            visible = v.pop("visible")
-            visible_public = v.pop("visiblePublic")
-            if not visible:
-                continue
-            if public and not visible_public:
-                continue
-            if frm is not None and v["along"] < frm:
-                continue
-            if to is not None and v["along"] > to:
-                continue
-            if not v["published"]:
-                # A lone (below-threshold) Tier B/A/M report still shows, marked
-                # unconfirmed via its own `published: false` -- a real linked (or
-                # registry-vetted) identity's single report is worth SOME public
-                # visibility, unlike a bare anonymous Tier C claim, which stays
-                # fully invisible until it crosses k_anon on its own. One more
-                # report of ANY tier (including a second Tier C) adds its weight
-                # to the very same pool and can cross the (lower) k_tier_b
-                # threshold from here -- see ingest()'s corroboration-weight
-                # note; nothing extra needed to "confirm" it.
-                show_unconfirmed = v["tier"] != "C" and v["distinctSources"] >= 1
-                if not (include_unpublished or show_unconfirmed):
+            for r in rows:
+                canon, raw_last_seen = r[2], r[9]
+                v = self._row_view(net, r, now)
+                if now - raw_last_seen > self._effective_ttl(v["tier"]):
+                    continue  # past this tier's own decay window (TIER_TTL_OVERRIDE)
+                # Reveal delay (REVEAL_DELAY_RANGE, + PUBLIC_EXTRA_DELAY_RANGE for
+                # public=True): gates EVERY external read path alike -- the public
+                # feed and the bot/moderator-only /all feed both go through query(),
+                # so neither gets early visibility. Both flags popped rather than
+                # left in the dict since every row that survives this is trivially
+                # True for whichever gate(s) applied -- a constant, meaningless
+                # field on the wire.
+                visible = v.pop("visible")
+                visible_public = v.pop("visiblePublic")
+                if not visible:
                     continue
-            if v["cond"] in _HAZARD_CONDS:
-                clear_ts = self._active_clear(server, canon, v["seg"], v["along"], now)
-                # Compare against the row's raw timestamp, not the view's int-rounded
-                # lastSeen -- rounding made a hazard reported sub-second after a clear
-                # look older than the clear and get wrongly suppressed.
-                if clear_ts is not None and clear_ts > raw_last_seen:
-                    continue  # resolved: a newer published CLEAR supersedes this hazard
-            out.append(v)
+                if public and not visible_public:
+                    continue
+                if frm is not None and v["along"] < frm:
+                    continue
+                if to is not None and v["along"] > to:
+                    continue
+                if not v["published"]:
+                    # A lone (below-threshold) Tier B/A/M report still shows, marked
+                    # unconfirmed via its own `published: false` -- a real linked (or
+                    # registry-vetted) identity's single report is worth SOME public
+                    # visibility, unlike a bare anonymous Tier C claim, which stays
+                    # fully invisible until it crosses k_anon on its own. One more
+                    # report of ANY tier (including a second Tier C) adds its weight
+                    # to the very same pool and can cross the (lower) k_tier_b
+                    # threshold from here -- see ingest()'s corroboration-weight
+                    # note; nothing extra needed to "confirm" it.
+                    show_unconfirmed = v["tier"] != "C" and v["distinctSources"] >= 1
+                    if not (include_unpublished or show_unconfirmed):
+                        continue
+                if v["cond"] in _HAZARD_CONDS:
+                    clear_ts = self._active_clear(server, canon, v["seg"], v["along"], now)
+                    # Compare against the row's raw timestamp, not the view's int-rounded
+                    # lastSeen -- rounding made a hazard reported sub-second after a clear
+                    # look older than the clear and get wrongly suppressed.
+                    if clear_ts is not None and clear_ts > raw_last_seen:
+                        continue  # resolved: a newer published CLEAR supersedes this hazard
+                out.append(v)
         out.sort(key=lambda v: (v["road"] if v["road"] is not None else -1, v["seg"], v["along"]))
         return out
 
@@ -1191,6 +1200,11 @@ class Store:
         if net is None:
             raise KeyError(server)
         now = self.clock()
+        view_cache = {}
+        out = []
+        # Same reason as query()'s own lock comment: _view_by_id below runs its
+        # own queries against the shared connection, so the lock has to stay
+        # held for the whole loop, not just the initial SELECT.
         with self._lock:
             q = ("SELECT rl.id, rl.created_at, rl.cond_id"
                  " FROM report_log rl WHERE rl.server=? AND rl.tier='B'")
@@ -1200,21 +1214,19 @@ class Store:
                 args.append(since)
             q += " ORDER BY rl.created_at DESC"
             rows = self.db.execute(q, args).fetchall()
-        view_cache = {}
-        out = []
-        for log_id, created_at, cond_id in rows:
-            if cond_id not in view_cache:
-                view_cache[cond_id] = self._view_by_id(net, cond_id, now)
-            v = view_cache[cond_id]
-            if not (v["published"] and v["visiblePublic"]):
-                continue
-            out.append({
-                "id": log_id, "tier": "B",
-                "createdAt": int(created_at), "road": v["road"], "seg": v["seg"],
-                "along": v["along"], "cond": v["cond"], "x": v["x"], "z": v["z"],
-            })
-            if len(out) >= limit:
-                break
+            for log_id, created_at, cond_id in rows:
+                if cond_id not in view_cache:
+                    view_cache[cond_id] = self._view_by_id(net, cond_id, now)
+                v = view_cache[cond_id]
+                if not (v["published"] and v["visiblePublic"]):
+                    continue
+                out.append({
+                    "id": log_id, "tier": "B",
+                    "createdAt": int(created_at), "road": v["road"], "seg": v["seg"],
+                    "along": v["along"], "cond": v["cond"], "x": v["x"], "z": v["z"],
+                })
+                if len(out) >= limit:
+                    break
         return out
 
     # ---- leaderboards (SS6.7): Survey (confirmed-report credit) and Road Crew
