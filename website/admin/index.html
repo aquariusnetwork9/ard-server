@@ -56,7 +56,16 @@
           <h3>📋 Report activity<span class="sub" id="reports-count"></span></h3>
           <p class="a-dim" style="margin:0 0 .5rem">Tier B and above only — who reported what, when.
             Anonymous (Tier C) reports carry no identity and never appear here.</p>
+          <div class="a-view-toggle">
+            <button id="reports-view-flat" class="btn small go" type="button">Flat log</button>
+            <button id="reports-view-episodes" class="btn small ghost" type="button">By location</button>
+          </div>
           <div id="reports-list" class="a-list"></div>
+          <p id="reports-episodes-hint" class="a-dim hidden" style="margin:.5rem 0">
+            Every report at the same location + condition collapses into one entry —
+            click to expand its full resend history. A hazard's episode sits right
+            above the CLEAR episode that resolved it, if any has yet.</p>
+          <div id="reports-episodes-list" class="a-list hidden"></div>
         </section>
 
         <section id="panel-identities" class="a-panel hidden">

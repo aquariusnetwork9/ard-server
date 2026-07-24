@@ -824,9 +824,16 @@ class Store:
         return view
 
     def _view_by_id(self, net, cond_id, now):
+        """None if cond_id no longer resolves -- a moderator's quash() deletes the
+        conditions row outright but doesn't touch report_log, so any caller
+        walking report_log by cond_id (list_report_log_public, list_hazard_episodes)
+        can hit a dangling id and must handle None rather than let _row_view
+        crash unpacking it."""
         r = self.db.execute(
             "SELECT id,server,road_canon,seg,along,cond,tier,reports,first_seen,last_seen,"
             "lane_min,lane_max,visible_at,public_delay_extra FROM conditions WHERE id=?", (cond_id,)).fetchone()
+        if r is None:
+            return None
         return self._row_view(net, r, now)
 
     def _row_view(self, net, r, now):
@@ -1221,6 +1228,8 @@ class Store:
                 if cond_id not in view_cache:
                     view_cache[cond_id] = self._view_by_id(net, cond_id, now)
                 v = view_cache[cond_id]
+                if v is None:
+                    continue  # condition since removed (moderator quash) -- nothing to show
                 if not (v["published"] and v["visiblePublic"]):
                     continue
                 out.append({
@@ -1231,6 +1240,70 @@ class Store:
                 if len(out) >= limit:
                     break
         return out
+
+    def list_hazard_episodes(self, server, since=None, limit=200):
+        """Groups list_report_log's flat per-event rows by cond_id into one
+        timeline entry per episode, admin-only (same audience as
+        list_report_log -- Tier B/A/M identity, never C).
+
+        cond_id IS already the right grouping key: `conditions` has a UNIQUE
+        constraint on (server, road_canon, seg, along, cond), so a resend
+        never creates a new row, it updates the SAME one -- every report_log
+        row sharing a cond_id is one location+condition-type's full resend
+        history (this is exactly what collapses e.g. 27 near-identical CLEAR
+        log lines into a single episode with a reportCount of 27).
+
+        Deliberately does NOT try to guess/assert which CLEAR episode
+        resolved which hazard episode -- ordering the result by (road, seg,
+        along, firstSeen) instead lets a location's full story read
+        top-to-bottom on its own (a HOLE episode immediately followed by the
+        CLEAR episode that resolved it) without this function ever risking a
+        wrong attribution if a hazard aged out and reappeared, or a CLEAR
+        turned out to be a false positive."""
+        net = self.networks.get(server)
+        if net is None:
+            raise KeyError(server)
+        now = self.clock()
+        episodes = {}
+        order = []
+        # Same reason as query()/list_report_log_public's own lock comments:
+        # _view_by_id below runs its own queries against the shared
+        # connection, so the lock has to stay held for the whole loop.
+        with self._lock:
+            q = ("SELECT rl.id, rl.cond_id, rl.tier, rl.discord_id, rl.token_id, rl.mc_uid,"
+                 " rl.counts_toward_corroboration, rl.created_at"
+                 " FROM report_log rl WHERE rl.server=?")
+            args = [server]
+            if since is not None:
+                q += " AND rl.created_at >= ?"
+                args.append(since)
+            q += " ORDER BY rl.created_at ASC"
+            rows = self.db.execute(q, args).fetchall()
+            missing = set()  # cond_ids already confirmed gone -- don't re-query per event
+            for log_id, cond_id, tier, discord_id, token_id, mc_uid, counts, created_at in rows:
+                if cond_id in missing:
+                    continue
+                if cond_id not in episodes:
+                    view = self._view_by_id(net, cond_id, now)
+                    if view is None:
+                        missing.add(cond_id)  # moderator quash -- nothing left to show
+                        continue
+                    view.pop("visible", None)
+                    view.pop("visiblePublic", None)
+                    episodes[cond_id] = {
+                        "condId": cond_id, "road": view["road"], "seg": view["seg"], "along": view["along"],
+                        "cond": view["cond"], "tier": view["tier"], "published": view["published"],
+                        "distinctSources": view["distinctSources"], "confidence": view["confidence"],
+                        "firstSeen": view["firstSeen"], "lastSeen": view["lastSeen"], "events": [],
+                    }
+                    order.append(cond_id)
+                episodes[cond_id]["events"].append({
+                    "id": log_id, "tier": tier, "discordId": discord_id, "tokenId": token_id,
+                    "mcUid": mc_uid, "countsTowardCorroboration": bool(counts), "createdAt": int(created_at),
+                })
+        out = [episodes[cid] for cid in order]
+        out.sort(key=lambda e: (e["road"] if e["road"] is not None else -1, e["seg"], e["along"], e["firstSeen"]))
+        return out[:limit]
 
     # ---- leaderboards (SS6.7): Survey (confirmed-report credit) and Road Crew
     # (completed dispatch claims) -- deliberately siloed per server, same as every
@@ -1619,6 +1692,7 @@ _CREDITS_LEADERBOARD_RE = re.compile(r"^/credits/([^/]+)/leaderboard$")
 _CONDITIONS_ALL_RE = re.compile(r"^/conditions/([^/]+)/all$")
 _REPORTS_LOG_RE = re.compile(r"^/reports/([^/]+)$")
 _REPORTS_LOG_PUBLIC_RE = re.compile(r"^/reports/([^/]+)/public$")
+_REPORTS_EPISODES_RE = re.compile(r"^/reports/([^/]+)/episodes$")
 _REGISTRY_ID_RE = re.compile(r"^/registry/([0-9a-f]{16})$")
 _IDENTITY_ACTION_RE = re.compile(r"^/identity/([^/]+)/([^/]+)/(suspend|reinstate)$")
 _IDENTITY_TIER_RE = re.compile(r"^/identity/([^/]+)/([^/]+)/tier$")
@@ -1735,6 +1809,9 @@ class Handler(BaseHTTPRequestHandler):
         m = _REPORTS_LOG_PUBLIC_RE.match(path)
         if m:
             return self._reports_log_public(m.group(1))
+        m = _REPORTS_EPISODES_RE.match(path)
+        if m:
+            return self._reports_episodes(m.group(1))
         m = _REPORTS_LOG_RE.match(path)
         if m:
             return self._reports_log(m.group(1))
@@ -2498,6 +2575,40 @@ class Handler(BaseHTTPRequestHandler):
             if row["tokenId"] is not None:
                 row["holderLabel"] = holder_labels.get(row["tokenId"])
         self._json(200, {"reports": rows})
+
+    def _reports_episodes(self, server):
+        # Same gate/audience as _reports_log -- this is list_report_log's data
+        # regrouped, not a different privilege level.
+        scopes = self._caller_scopes(server)
+        is_mod = self.app.auth.is_owner(self._token()) or \
+            trust.SCOPE_MODERATOR in scopes or trust.SCOPE_ADMIN in scopes
+        is_bot = self.app.auth.is_bot(self._token())
+        if not (is_mod or is_bot):
+            return self._json(403, {"error": "the bot credential or moderator/admin scope "
+                                              "is required for this server"})
+        if server not in self.app.store.networks:
+            return self._json(404, {"error": "unknown server"})
+        qs = parse_qs(urlparse(self.path).query)
+        try:
+            since = float(qs["since"][0]) if "since" in qs else None
+            limit = min(int(qs["limit"][0]), 500) if "limit" in qs else 200
+        except ValueError:
+            return self._json(400, {"error": "bad query param"})
+        episodes = self.app.store.list_hazard_episodes(server, since=since, limit=limit)
+        # Same discordId -> discordUsername / tokenId -> holderLabel enrichment
+        # as _reports_log, applied per nested event rather than per top-level row.
+        names = {}
+        if self.app.auth.links is not None:
+            names = {i["discordId"]: i["discordUsername"]
+                     for i in self.app.auth.links.list_identities(server)}
+        holder_labels = {t["tokenId"]: t["holderLabel"] for t in self.app.auth.registry.list_active(server)}
+        for episode in episodes:
+            for event in episode["events"]:
+                if event["discordId"] is not None:
+                    event["discordUsername"] = names.get(event["discordId"])
+                if event["tokenId"] is not None:
+                    event["holderLabel"] = holder_labels.get(event["tokenId"])
+        self._json(200, {"episodes": episodes})
 
     def _reports_log_public(self, server):
         # Public, rate-limited like every other public read (PROTOCOL.md SS7) --

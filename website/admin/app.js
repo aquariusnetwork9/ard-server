@@ -149,7 +149,7 @@
     $("panel-identity").classList.toggle("hidden", !isMod);
     $("panel-registry").classList.toggle("hidden", !isAdmin);
     $("panel-grants").classList.toggle("hidden", !isAdmin);
-    if (isMod) { loadModeration(server); loadReports(server); loadIdentities(server); }
+    if (isMod) { loadModeration(server); loadReports(server); loadReportEpisodes(server); loadIdentities(server); }
     if (isAdmin) { loadRegistry(server); loadGrants(server); }
   }
 
@@ -222,6 +222,63 @@
       });
     });
   }
+
+  // ---- per-report audit log, grouped by location+condition-type ----
+  // Same underlying data as loadReports (list_report_log), just regrouped
+  // server-side by cond_id -- see Store.list_hazard_episodes's own docstring
+  // for why that's already the right dedup key (a resend never creates a new
+  // conditions row, it updates the same one).
+  function loadReportEpisodes(server) {
+    api("/reports/" + encodeURIComponent(server) + "/episodes?limit=100").then(function (res) {
+      var el = $("reports-episodes-list");
+      if (!res.ok) { el.textContent = res.body.error || "couldn't load"; return; }
+      var episodes = res.body.episodes || [];
+      el.innerHTML = "";
+      if (!episodes.length) { el.innerHTML = "<div class=\"a-empty\">No Tier B+ reports logged yet on this server.</div>"; return; }
+      episodes.forEach(function (ep) {
+        var where = "road " + ep.road + " seg " + ep.seg + " along " + ep.along;
+        var span = ep.firstSeen === ep.lastSeen ? fmtDate(ep.firstSeen)
+          : fmtDate(ep.firstSeen) + " → " + fmtDate(ep.lastSeen);
+        var sub = where + " · " + ep.events.length + " report(s), " + ep.distinctSources + " distinct source(s)"
+          + " · confidence " + ep.confidence + (ep.published ? "" : " · unconfirmed") + " · " + span;
+
+        var details = document.createElement("details");
+        details.className = "a-episode";
+        var summary = document.createElement("summary");
+        summary.innerHTML = "<span class=\"a-ic\">📋</span>"
+          + "<div class=\"a-bd\"><div class=\"n\"></div><div class=\"c\"></div></div>"
+          + "<span class=\"a-tag " + ep.tier + "\">" + ep.tier + "</span>";
+        summary.querySelector(".n").textContent = ep.cond;
+        summary.querySelector(".c").textContent = sub;
+        details.appendChild(summary);
+
+        var events = document.createElement("div");
+        events.className = "a-episode-events";
+        ep.events.forEach(function (ev) {
+          var who = ev.discordId ? (ev.discordUsername || ev.discordId) : (ev.holderLabel || ev.tokenId);
+          var line = document.createElement("div");
+          line.className = "a-episode-event";
+          line.innerHTML = "<b></b> · " + fmtDate(ev.createdAt)
+            + (ev.countsTowardCorroboration ? "" : " <span class=\"miss\">· didn't count (non-overlap/travel check)</span>");
+          line.querySelector("b").textContent = who + " (" + ev.tier + ")";
+          events.appendChild(line);
+        });
+        details.appendChild(events);
+        el.appendChild(details);
+      });
+    });
+  }
+
+  function setReportsView(mode) {
+    var flat = mode === "flat";
+    $("reports-list").classList.toggle("hidden", !flat);
+    $("reports-episodes-list").classList.toggle("hidden", flat);
+    $("reports-episodes-hint").classList.toggle("hidden", flat);
+    $("reports-view-flat").className = "btn small " + (flat ? "go" : "ghost");
+    $("reports-view-episodes").className = "btn small " + (flat ? "ghost" : "go");
+  }
+  $("reports-view-flat").onclick = function () { setReportsView("flat"); };
+  $("reports-view-episodes").onclick = function () { setReportsView("episodes"); };
 
   // ---- registry tokens ----
   function loadRegistry(server) {

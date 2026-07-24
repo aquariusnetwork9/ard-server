@@ -376,6 +376,96 @@ class ReportsLogHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)  # doesn't error -- just silently caps server-side
 
 
+class ReportsEpisodesHttpTests(unittest.TestCase):
+    """GET /reports/<server>/episodes -- list_report_log's rows regrouped by
+    cond_id into one timeline entry per location+condition-type. Same gate/
+    audience as /reports/<server> (this is that same data, not a different
+    privilege level), plus the same discordUsername/holderLabel enrichment,
+    applied per nested event instead of per top-level row."""
+
+    @classmethod
+    def setUpClass(cls):
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=1, ttl=1000, salt="testsalt-episodes-http")
+        registry = trust.Registry()
+        registry.issue("episodes-mod", "test-owner", trust.SCOPE_MODERATOR, SERVER, token=MODERATOR_TOKEN)
+        registry.issue("episodes-fleet", "test-owner", trust.SCOPE_FULL, SERVER, token=FULL_TOKEN)
+        links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8, require_ownership_proof=False)
+        auth = Auth(registry, links=links, bot_hashes={Auth.hash_token(BOT_TOKEN)})
+        cls.links = links
+        cls.app = App(store, auth)
+        cls.srv = Server(("127.0.0.1", 0), cls.app)
+        cls.port = cls.srv.server_address[1]
+        cls.net = store.networks[SERVER]
+        cls.map = store.map_hashes[SERVER]
+        cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.t.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def a_report(self, x, cond="HOLE"):
+        return reference_client.build_report(x, 120, 0, "NETHER", self.net, self.map,
+                                             SERVER, cond=cond)
+
+    def link_and_get_token(self, mc_uid, discord_id):
+        code = self.links.init_link(mc_uid, SERVER)
+        _, token = self.links.complete_link(code, discord_id, discord_id.upper())
+        return token
+
+    def test_requires_bot_or_moderator_credential(self):
+        status, _ = req("GET", self.url(f"/reports/{SERVER}/episodes"))
+        self.assertEqual(status, 403)
+        status, _ = req("GET", self.url(f"/reports/{SERVER}/episodes"), token=MODERATOR_TOKEN)
+        self.assertEqual(status, 200)
+
+    def test_resends_collapse_into_one_episode_with_nested_events(self):
+        token = self.link_and_get_token("mc-episodes-1", "discord-episodes-1")
+        for _ in range(3):
+            req("POST", self.url("/report"), token=token, body=self.a_report(17000))
+        status, body = req("GET", self.url(f"/reports/{SERVER}/episodes"), token=MODERATOR_TOKEN)
+        self.assertEqual(status, 200)
+        episode = next(e for e in body["episodes"]
+                        if any(ev["discordId"] == "discord-episodes-1" for ev in e["events"]))
+        self.assertEqual(len(episode["events"]), 3)
+
+    def test_tier_b_event_shows_discord_id_and_resolved_username(self):
+        token = self.link_and_get_token("mc-episodes-2", "discord-episodes-2")
+        req("POST", self.url("/report"), token=token, body=self.a_report(17100))
+        status, body = req("GET", self.url(f"/reports/{SERVER}/episodes"), token=MODERATOR_TOKEN)
+        self.assertEqual(status, 200)
+        episode = next(e for e in body["episodes"]
+                        if any(ev["discordId"] == "discord-episodes-2" for ev in e["events"]))
+        event = episode["events"][0]
+        self.assertEqual(event["tier"], "B")
+        self.assertEqual(event["discordUsername"], "DISCORD-EPISODES-2")
+        self.assertIn("along", episode)
+
+    def test_tier_a_event_shows_token_id_and_holder_label(self):
+        req("POST", self.url("/report"), token=FULL_TOKEN, body=self.a_report(17300))
+        status, body = req("GET", self.url(f"/reports/{SERVER}/episodes"), token=MODERATOR_TOKEN)
+        self.assertEqual(status, 200)
+        episode = next(e for e in body["episodes"] if e["events"][0]["tier"] == "A")
+        self.assertEqual(episode["events"][0]["holderLabel"], "episodes-fleet")
+
+    def test_anonymous_reports_never_appear(self):
+        req("POST", self.url("/report"), body=self.a_report(17600))
+        status, body = req("GET", self.url(f"/reports/{SERVER}/episodes"), token=MODERATOR_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertFalse(any(e["along"] == self.a_report(17600)["along"] for e in body["episodes"]))
+
+    def test_readable_by_the_bot_too(self):
+        status, _ = req("GET", self.url(f"/reports/{SERVER}/episodes"), token=BOT_TOKEN)
+        self.assertEqual(status, 200)
+
+    def test_limit_is_capped_at_500(self):
+        status, _ = req("GET", self.url(f"/reports/{SERVER}/episodes?limit=99999"), token=MODERATOR_TOKEN)
+        self.assertEqual(status, 200)  # doesn't error -- just silently caps server-side
+
+
 class ReportsLogPublicHttpTests(unittest.TestCase):
     """GET /reports/<server>/public -- the public website's Tier B activity
     feed: readable by anyone, no credential required, and ALWAYS anonymous --
