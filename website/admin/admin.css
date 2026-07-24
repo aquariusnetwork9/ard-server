@@ -92,7 +92,15 @@
 
 /* three-column workspace */
 .a-ws { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; align-items: start; }
-.a-col { display: flex; flex-direction: column; gap: 1rem; }
+/* min-width: 0 overrides a grid item's default `min-width: auto` -- without
+   it, a column refuses to shrink below its content's min-content width (the
+   longest unbreakable run of text/inline content inside it), which can force
+   the whole grid -- and the page -- wider than the viewport. Three narrower
+   columns make this far more likely to actually bite than the previous
+   two-column layout did; the individual overflow/ellipsis rules already on
+   .a-item/.a-episode's text spans only do their job once the column itself
+   is correctly constrained to its track width in the first place. */
+.a-col { display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
 
 /* panel card */
 .a-panel {
