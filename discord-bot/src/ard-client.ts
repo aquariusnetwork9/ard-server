@@ -39,6 +39,8 @@ export interface DispatchEntry {
   road: number | null;
   seg: number;
   along: number;
+  x: number | null;
+  z: number | null;
   trigger: 'reopen' | 'conflict' | 'low_trust' | 'manual';
   priority: number;
   status: 'queued' | 'claimed';
@@ -168,6 +170,8 @@ export interface ConditionEntry {
   road: number | null;
   seg: number;
   along: number;
+  x: number | null;
+  z: number | null;
   cond: string;
   tier: 'A' | 'M' | 'B' | 'C';
   reports: number;

@@ -63,7 +63,8 @@ class Registry:
           scope TEXT NOT NULL,
           server TEXT NOT NULL DEFAULT '',
           revoked INTEGER NOT NULL DEFAULT 0,
-          revoked_at REAL
+          revoked_at REAL,
+          discord_id TEXT
         );
         CREATE TABLE IF NOT EXISTS discord_grants(
           grant_id TEXT PRIMARY KEY,
@@ -86,12 +87,22 @@ class Registry:
         if "server" not in cols:
             self.db.execute("ALTER TABLE tokens ADD COLUMN server TEXT NOT NULL DEFAULT '2b2t.org'")
             self.db.commit()
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(tokens)").fetchall()}
+        if "discord_id" not in cols:
+            # Nullable -- most tokens are held by a fleet bot/script with no
+            # Discord identity behind them at all. Only ever set for a token
+            # minted through the admin dashboard's per-identity tier changer
+            # (see highway_conditions.py's _identity_set_tier), so that flow can
+            # find and revoke a specific identity's own A/M token later without
+            # relying on holder_label being a stable, parseable convention.
+            self.db.execute("ALTER TABLE tokens ADD COLUMN discord_id TEXT")
+            self.db.commit()
 
     @staticmethod
     def hash_token(tok):
         return hashlib.sha256(tok.encode()).hexdigest()
 
-    def issue(self, holder_label, issued_by, scope, server, token=None):
+    def issue(self, holder_label, issued_by, scope, server, token=None, discord_id=None):
         """Create a new registry entry, scoped to exactly one `server`. Returns
         (token_id, raw_token) — the raw token is the only time it's ever
         returned; only its hash is kept.
@@ -104,7 +115,12 @@ class Registry:
         gets re-issued on every process restart, so re-seeding an already-known
         token updates its label/scope/server in place instead of hitting the
         token_hash UNIQUE constraint. A token the Owner has since revoked stays
-        revoked — re-seeding never resurrects it."""
+        revoked — re-seeding never resurrects it.
+
+        `discord_id`, when given, ties this token to a specific linked identity
+        (the admin dashboard's per-identity tier changer -- see
+        highway_conditions.py's _identity_set_tier) rather than a bot/script
+        holder with no Discord identity at all -- see tokens_for_discord."""
         if scope not in SCOPES:
             raise ValueError(f"bad scope {scope!r}, must be one of {sorted(SCOPES)}")
         if not holder_label:
@@ -124,15 +140,15 @@ class Registry:
                     token_id, revoked = existing
                     if not revoked:
                         self.db.execute(
-                            "UPDATE tokens SET holder_label=?, scope=?, server=? WHERE token_id=?",
-                            (holder_label, scope, server, token_id))
+                            "UPDATE tokens SET holder_label=?, scope=?, server=?, discord_id=? WHERE token_id=?",
+                            (holder_label, scope, server, discord_id, token_id))
                         self.db.commit()
                     return token_id, token
             token_id = secrets.token_hex(8)
             self.db.execute(
                 "INSERT INTO tokens(token_id,token_hash,holder_label,issued_by,"
-                "issued_at,scope,server,revoked) VALUES(?,?,?,?,?,?,?,0)",
-                (token_id, token_hash, holder_label, issued_by, now, scope, server))
+                "issued_at,scope,server,revoked,discord_id) VALUES(?,?,?,?,?,?,?,0,?)",
+                (token_id, token_hash, holder_label, issued_by, now, scope, server, discord_id))
             self.db.commit()
         return token_id, token
 
@@ -175,14 +191,14 @@ class Registry:
         with self._lock:
             if server is None:
                 rows = self.db.execute(
-                    "SELECT token_id, holder_label, issued_by, issued_at, scope, server"
+                    "SELECT token_id, holder_label, issued_by, issued_at, scope, server, discord_id"
                     " FROM tokens WHERE revoked=0 ORDER BY issued_at").fetchall()
             else:
                 rows = self.db.execute(
-                    "SELECT token_id, holder_label, issued_by, issued_at, scope, server"
+                    "SELECT token_id, holder_label, issued_by, issued_at, scope, server, discord_id"
                     " FROM tokens WHERE revoked=0 AND server=? ORDER BY issued_at", (server,)).fetchall()
         return [{"tokenId": r[0], "holderLabel": r[1], "issuedBy": r[2],
-                 "issuedAt": int(r[3]), "scope": r[4], "server": r[5]} for r in rows]
+                 "issuedAt": int(r[3]), "scope": r[4], "server": r[5], "discordId": r[6]} for r in rows]
 
     def token_server(self, token_id):
         """The `server` an existing registry token belongs to, or None — lets a
@@ -191,6 +207,38 @@ class Registry:
         with self._lock:
             row = self.db.execute("SELECT server FROM tokens WHERE token_id=?", (token_id,)).fetchone()
         return row[0] if row else None
+
+    # ---- per-identity tier (Tier A/M tokens tied to a linked Discord identity) ----
+    def tokens_for_discord(self, discord_id, server):
+        """Every live registry token tied to this Discord identity ON THIS server
+        (see issue()'s discord_id param) -- used by the admin dashboard's tier
+        changer to show a linked identity's current Tier A/M standing and to find
+        what to revoke on a downgrade. Independent of Tier B linking entirely --
+        a token here works regardless of whether the identity is even linked."""
+        if not discord_id or not server:
+            return []
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT token_id, scope FROM tokens"
+                " WHERE discord_id=? AND server=? AND revoked=0", (discord_id, server)).fetchall()
+        return [{"tokenId": r[0], "scope": r[1]} for r in rows]
+
+    def revoke_all_for_discord(self, discord_id, server):
+        """Revokes every live identity-tied token for (discord_id, server) --
+        the tier changer calls this before granting a new tier so an identity
+        only ever holds one tier's worth of registry standing at a time. Returns
+        how many were revoked. Never touches a token with no discord_id (a bot/
+        script holder's token can't collide with this regardless of label)."""
+        if not discord_id or not server:
+            return 0
+        now = self.clock()
+        with self._lock:
+            cur = self.db.execute(
+                "UPDATE tokens SET revoked=1, revoked_at=?"
+                " WHERE discord_id=? AND server=? AND revoked=0",
+                (now, discord_id, server))
+            self.db.commit()
+            return cur.rowcount
 
     # ---- discord_grants: dashboard access granted directly to a Discord identity ----
     def grant_to_discord(self, discord_id, scope, server, granted_by):

@@ -168,6 +168,52 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(self.reg.list_active(), [])
 
 
+class DiscordIdentityTierTests(unittest.TestCase):
+    """Registry tokens optionally tied to a linked Discord identity -- backs the
+    admin dashboard's per-identity tier changer (Tier A/M via a dedicated
+    token), independent of Tier B/C (identity.py's LinkStore) entirely."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.reg = trust.Registry(clock=self.clock)
+
+    def test_issued_token_can_be_tied_to_a_discord_identity(self):
+        self.reg.issue("discord:disc-1", "admin:disc-owner", trust.SCOPE_FULL, S1, discord_id="disc-1")
+        tokens = self.reg.tokens_for_discord("disc-1", S1)
+        self.assertEqual(len(tokens), 1)
+        self.assertEqual(tokens[0]["scope"], trust.SCOPE_FULL)
+
+    def test_untied_tokens_never_show_up_for_any_identity(self):
+        self.reg.issue("fleet-bot-1", "owner", trust.SCOPE_FULL, S1)  # no discord_id
+        self.assertEqual(self.reg.tokens_for_discord("disc-1", S1), [])
+
+    def test_tokens_for_discord_scoped_per_server(self):
+        self.reg.issue("discord:disc-1", "admin", trust.SCOPE_FULL, S1, discord_id="disc-1")
+        self.assertEqual(self.reg.tokens_for_discord("disc-1", S2), [])
+
+    def test_revoke_all_for_discord_revokes_only_that_identitys_tokens(self):
+        self.reg.issue("discord:disc-1", "admin", trust.SCOPE_FULL, S1, discord_id="disc-1")
+        _, other_tok = self.reg.issue("fleet-bot-1", "owner", trust.SCOPE_FULL, S1)  # untied, must survive
+        revoked = self.reg.revoke_all_for_discord("disc-1", S1)
+        self.assertEqual(revoked, 1)
+        self.assertEqual(self.reg.tokens_for_discord("disc-1", S1), [])
+        self.assertTrue(self.reg.has_scope(other_tok, trust.SCOPE_FULL, S1), "untied token must be untouched")
+
+    def test_revoke_all_for_discord_is_scoped_per_server(self):
+        self.reg.issue("discord:disc-1", "admin", trust.SCOPE_FULL, S1, discord_id="disc-1")
+        self.reg.issue("discord:disc-1", "admin", trust.SCOPE_MAINTAINER, S2, discord_id="disc-1")
+        self.reg.revoke_all_for_discord("disc-1", S1)
+        self.assertEqual(self.reg.tokens_for_discord("disc-1", S1), [])
+        self.assertEqual(len(self.reg.tokens_for_discord("disc-1", S2)), 1, "S2's token must be untouched")
+
+    def test_list_active_reports_discord_id_when_tied(self):
+        self.reg.issue("discord:disc-1", "admin", trust.SCOPE_FULL, S1, discord_id="disc-1")
+        self.reg.issue("fleet-bot-1", "owner", trust.SCOPE_MAINTAINER, S1)
+        by_label = {t["holderLabel"]: t["discordId"] for t in self.reg.list_active(S1)}
+        self.assertEqual(by_label["discord:disc-1"], "disc-1")
+        self.assertIsNone(by_label["fleet-bot-1"])
+
+
 class DiscordGrantTests(unittest.TestCase):
     """Admin dashboard access granted directly to a Discord identity (no bearer
     token involved) -- the credential the sessions.py cookie flow resolves."""

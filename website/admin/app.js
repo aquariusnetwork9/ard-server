@@ -144,11 +144,12 @@
     var isMod = scopes.has("moderator") || isAdmin;
     $("server-scope-badge").textContent = Array.from(scopes).join(", ") || "no scope";
     $("panel-moderation").classList.toggle("hidden", !isMod);
+    $("panel-reports").classList.toggle("hidden", !isMod);
     $("panel-identities").classList.toggle("hidden", !isMod);
     $("panel-identity").classList.toggle("hidden", !isMod);
     $("panel-registry").classList.toggle("hidden", !isAdmin);
     $("panel-grants").classList.toggle("hidden", !isAdmin);
-    if (isMod) { loadModeration(server); loadIdentities(server); }
+    if (isMod) { loadModeration(server); loadReports(server); loadIdentities(server); }
     if (isAdmin) { loadRegistry(server); loadGrants(server); }
   }
 
@@ -196,6 +197,29 @@
     api("/moderation/" + id + "/" + action, { method: "POST" }).then(function (res) {
       toast(res.ok ? "Resolved" : (res.body.error || "failed"), !res.ok);
       if (res.ok) loadModeration(server);
+    });
+  }
+
+  // ---- per-report audit log (Tier B+ only) ----
+  function loadReports(server) {
+    api("/reports/" + encodeURIComponent(server) + "?limit=100").then(function (res) {
+      var el = $("reports-list");
+      if (!res.ok) { el.textContent = res.body.error || "couldn't load"; return; }
+      var reports = res.body.reports || [];
+      $("reports-count").textContent = reports.length;
+      el.innerHTML = "";
+      if (!reports.length) { el.innerHTML = "<div class=\"a-empty\">No Tier B+ reports logged yet on this server.</div>"; return; }
+      reports.forEach(function (r) {
+        // Tier B carries discordUsername (falls back to the bare id); Tier A/M
+        // carries holderLabel (the registry token's own label) -- exactly one
+        // of the two is ever set, matching ingest()'s report_log write.
+        var who = r.discordId ? (r.discordUsername || r.discordId) : (r.holderLabel || r.tokenId);
+        var where = "road " + r.road + " seg " + r.seg
+          + (r.x !== null && r.z !== null ? " (" + r.x + ", " + r.z + ")" : "");
+        var sub = who + " · " + where + " · " + fmtDate(r.createdAt)
+          + (r.countsTowardCorroboration ? "" : " · didn't count (non-overlap/travel check)");
+        el.appendChild(itemRow("📋", r.cond, sub, r.tier));
+      });
     });
   }
 
@@ -320,7 +344,28 @@
     });
   }
 
+  var TIER_LABEL = { A: "Tier A (full)", M: "Tier M (maintainer)", B: "Tier B (linked)", C: "Tier C (anonymous)" };
+
+  function runSetTier(server, discordId, tier, onDone) {
+    api("/identity/" + encodeURIComponent(server) + "/" + encodeURIComponent(discordId) + "/tier",
+      { method: "POST", json: { tier: tier } }).then(function (res) {
+      if (!res.ok) { toast(res.body.error || "failed", true); return; }
+      toast("Set to " + TIER_LABEL[tier]);
+      if (res.body.token) {
+        // A/M grants mint a real bearer token -- shown once, same convention as
+        // the Registry panel's "Issue a new token", since this ultimately issues
+        // one on the admin's behalf (see _identity_set_tier).
+        window.prompt(
+          "New " + TIER_LABEL[tier] + " token for " + discordId + " -- copy it now, it's never shown again:",
+          res.body.token
+        );
+      }
+      if (onDone) onDone();
+    });
+  }
+
   function loadIdentities(server) {
+    var isAdmin = scopesFor(server).has("admin");
     api("/identities/" + encodeURIComponent(server)).then(function (res) {
       var el = $("identities-list");
       if (!res.ok) { el.textContent = res.body.error || "couldn't load"; return; }
@@ -335,26 +380,53 @@
         var uidCount = (id.linkedUids || []).length;
         var sub = id.discordId + " · " + uidCount + " UID" + (uidCount === 1 ? "" : "s")
           + " linked · since " + fmtDate(id.linkedAt) + (id.creditOptIn ? " · credit opt-in" : "");
-        var row = itemRow("👤", name, sub, id.suspended ? "suspended" : "");
+        var row = itemRow("👤", name, sub, id.tier);
         var actions = document.createElement("div");
         actions.className = "a-actions";
-        if (id.suspended) {
-          var reinstate = document.createElement("button");
-          reinstate.className = "btn go small";
-          reinstate.textContent = "Reinstate";
-          reinstate.onclick = function () {
-            runIdentityAction(server, id.discordId, "reinstate", function () { loadIdentities(server); });
-          };
-          actions.appendChild(reinstate);
-        } else {
-          var suspend = document.createElement("button");
-          suspend.className = "btn warn small";
-          suspend.textContent = "Suspend";
-          suspend.onclick = function () {
-            runIdentityAction(server, id.discordId, "suspend", function () { loadIdentities(server); });
-          };
-          actions.appendChild(suspend);
+
+        // Plain suspend/reinstate stays moderator-reachable and only ever
+        // touches Tier B/C link status -- hidden once an admin has granted a
+        // Tier A/M token, since that's what actually governs standing then
+        // (clicking it wouldn't change what the roster shows as this row's tier).
+        if (id.tier === "B" || id.tier === "C") {
+          if (id.suspended) {
+            var reinstate = document.createElement("button");
+            reinstate.className = "btn go small";
+            reinstate.textContent = "Reinstate";
+            reinstate.onclick = function () {
+              runIdentityAction(server, id.discordId, "reinstate", function () { loadIdentities(server); });
+            };
+            actions.appendChild(reinstate);
+          } else {
+            var suspend = document.createElement("button");
+            suspend.className = "btn warn small";
+            suspend.textContent = "Suspend";
+            suspend.onclick = function () {
+              runIdentityAction(server, id.discordId, "suspend", function () { loadIdentities(server); });
+            };
+            actions.appendChild(suspend);
+          }
         }
+
+        if (isAdmin) {
+          var tierSelect = document.createElement("select");
+          tierSelect.className = "a-tier-select";
+          ["A", "M", "B", "C"].forEach(function (t) {
+            var opt = document.createElement("option");
+            opt.value = t; opt.textContent = TIER_LABEL[t];
+            if (t === id.tier) opt.selected = true;
+            tierSelect.appendChild(opt);
+          });
+          var setBtn = document.createElement("button");
+          setBtn.className = "btn small";
+          setBtn.textContent = "Set tier";
+          setBtn.onclick = function () {
+            runSetTier(server, id.discordId, tierSelect.value, function () { loadIdentities(server); });
+          };
+          actions.appendChild(tierSelect);
+          actions.appendChild(setBtn);
+        }
+
         row.appendChild(actions);
         el.appendChild(row);
       });

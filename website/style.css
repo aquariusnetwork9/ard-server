@@ -99,6 +99,12 @@ html, body {
 .legend-row { display: flex; align-items: center; gap: 6px; font-size: 12px; }
 .legend-swatch { width: 10px; height: 10px; border-radius: 50%; flex: none; }
 
+.dim-note { color: var(--txt-dim); font-size: 10px; text-transform: none; letter-spacing: normal; }
+#activity-items { display: flex; flex-direction: column; gap: 4px; max-height: 140px; overflow-y: auto; }
+.activity-row { font-size: 11px; line-height: 1.35; color: var(--txt-dim); }
+.activity-row b { color: var(--txt); font-weight: 700; }
+.activity-empty { font-size: 11px; color: var(--txt-dim); font-style: italic; }
+
 #status-line { color: var(--txt-dim); font-size: 12px; }
 
 #protocol-link, #link-account-link, #admin-link, #privacy-link, #terms-link {

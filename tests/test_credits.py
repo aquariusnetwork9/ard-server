@@ -24,7 +24,17 @@ SERVER = "2b2t.org"
 FULL_TOKEN = "FULL-SECRET-CREDITS"
 MODERATOR_TOKEN = "MODERATOR-SECRET-CREDITS"
 BOT_TOKEN = "BOT-SECRET-CREDITS"
+OWNER_TOKEN = "OWNER-SECRET-CREDITS"
 NOBODY_TOKEN = "SOME-RANDOM-TOKEN-CREDITS"
+
+
+class _ZeroRand:
+    """Deterministic stand-in for Store's rand= -- every reveal-delay draw
+    comes out 0, so these tests (unrelated to the reveal-delay feature) keep
+    seeing conditions the instant they're ingested. See test_reveal_delay.py
+    for the feature's own dedicated tests."""
+    def uniform(self, lo, hi):
+        return 0.0
 
 
 def req(method, url, token=None, body=None):
@@ -50,7 +60,7 @@ class SurveyCreditTests(unittest.TestCase):
     def setUpClass(cls):
         # k_tier_b=1 -- a single opted-in Tier B report is enough to publish a
         # hazard condition on its own, keeping most tests here to one report.
-        store = Store(str(GEO_DIR), k_anon=2, k_tier_b=1, ttl=1000, salt="testsalt-credits")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, k_tier_b=1, ttl=1000, salt="testsalt-credits")
         registry = trust.Registry()
         registry.issue("credits-fleet", "test-owner", trust.SCOPE_FULL, SERVER, token=FULL_TOKEN)
         registry.issue("credits-mod", "test-owner", trust.SCOPE_MODERATOR, SERVER, token=MODERATOR_TOKEN)
@@ -174,7 +184,7 @@ class RepairLeaderboardTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-repairs")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt-repairs")
         registry = trust.Registry()
         registry.issue("repairs-fleet", "test-owner", trust.SCOPE_FULL, SERVER, token=FULL_TOKEN)
         registry.issue("repairs-mod", "test-owner", trust.SCOPE_MODERATOR, SERVER, token=MODERATOR_TOKEN)
@@ -247,7 +257,7 @@ class ConditionsAllHttpTests(unittest.TestCase):
         # k_anon=2 so a single anonymous report stays clearly unpublished (needs a
         # second corroborating source) -- exactly the "lone sketchy report" case
         # radar needs to see that the public route can't provide.
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-condall")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt-condall")
         registry = trust.Registry()
         registry.issue("condall-mod", "test-owner", trust.SCOPE_MODERATOR, SERVER, token=MODERATOR_TOKEN)
         auth = Auth(registry, links=None, bot_hashes={Auth.hash_token(BOT_TOKEN)})
@@ -288,6 +298,169 @@ class ConditionsAllHttpTests(unittest.TestCase):
         self.assertEqual(status, 403)
         status, _ = req("GET", self.url(f"/conditions/{SERVER}/all"), token=MODERATOR_TOKEN)
         self.assertEqual(status, 200)
+
+
+class ReportsLogHttpTests(unittest.TestCase):
+    """GET /reports/<server> -- the per-report audit log (Tier B+ only), naming
+    who filed each report. Same privileged gate as /conditions/<server>/all and
+    the credits leaderboard, plus discordUsername/holderLabel enrichment."""
+
+    @classmethod
+    def setUpClass(cls):
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=1, ttl=1000, salt="testsalt-reportlog-http")
+        registry = trust.Registry()
+        registry.issue("reportlog-mod", "test-owner", trust.SCOPE_MODERATOR, SERVER, token=MODERATOR_TOKEN)
+        registry.issue("reportlog-fleet", "test-owner", trust.SCOPE_FULL, SERVER, token=FULL_TOKEN)
+        links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8, require_ownership_proof=False)
+        auth = Auth(registry, links=links, bot_hashes={Auth.hash_token(BOT_TOKEN)})
+        cls.links = links
+        cls.app = App(store, auth)
+        cls.srv = Server(("127.0.0.1", 0), cls.app)
+        cls.port = cls.srv.server_address[1]
+        cls.net = store.networks[SERVER]
+        cls.map = store.map_hashes[SERVER]
+        cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.t.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def a_report(self, x, cond="HOLE"):
+        return reference_client.build_report(x, 120, 0, "NETHER", self.net, self.map,
+                                             SERVER, cond=cond)
+
+    def link_and_get_token(self, mc_uid, discord_id):
+        code = self.links.init_link(mc_uid, SERVER)
+        _, token = self.links.complete_link(code, discord_id, discord_id.upper())
+        return token
+
+    def test_requires_bot_or_moderator_credential(self):
+        status, _ = req("GET", self.url(f"/reports/{SERVER}"))
+        self.assertEqual(status, 403)
+        status, _ = req("GET", self.url(f"/reports/{SERVER}"), token=MODERATOR_TOKEN)
+        self.assertEqual(status, 200)
+
+    def test_tier_b_report_shows_discord_id_and_resolved_username(self):
+        token = self.link_and_get_token("mc-reportlog-1", "discord-reportlog-1")
+        req("POST", self.url("/report"), token=token, body=self.a_report(15000))
+        status, body = req("GET", self.url(f"/reports/{SERVER}"), token=MODERATOR_TOKEN)
+        self.assertEqual(status, 200)
+        row = next(r for r in body["reports"] if r["discordId"] == "discord-reportlog-1")
+        self.assertEqual(row["tier"], "B")
+        self.assertEqual(row["discordUsername"], "DISCORD-REPORTLOG-1")
+        self.assertIn("along", row)
+
+    def test_tier_a_report_shows_token_id_and_holder_label(self):
+        req("POST", self.url("/report"), token=FULL_TOKEN, body=self.a_report(15300))
+        status, body = req("GET", self.url(f"/reports/{SERVER}"), token=MODERATOR_TOKEN)
+        self.assertEqual(status, 200)
+        row = next(r for r in body["reports"] if r["tier"] == "A")
+        self.assertEqual(row["holderLabel"], "reportlog-fleet")
+
+    def test_anonymous_reports_never_appear(self):
+        req("POST", self.url("/report"), body=self.a_report(15600))
+        status, body = req("GET", self.url(f"/reports/{SERVER}"), token=MODERATOR_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertFalse(any(r["along"] == self.a_report(15600)["along"] for r in body["reports"]))
+
+    def test_readable_by_the_bot_too(self):
+        status, _ = req("GET", self.url(f"/reports/{SERVER}"), token=BOT_TOKEN)
+        self.assertEqual(status, 200)
+
+    def test_limit_is_capped_at_500(self):
+        status, _ = req("GET", self.url(f"/reports/{SERVER}?limit=99999"), token=MODERATOR_TOKEN)
+        self.assertEqual(status, 200)  # doesn't error -- just silently caps server-side
+
+
+class ReportsLogPublicHttpTests(unittest.TestCase):
+    """GET /reports/<server>/public -- the public website's Tier B activity
+    feed: readable by anyone, no credential required, and ALWAYS anonymous --
+    no discordId/mcUid for ANY caller, admin included. Nobody should be able
+    to correlate report events into "the same traveler" and infer who was
+    where, in what direction, just from the public map."""
+
+    @classmethod
+    def setUpClass(cls):
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, k_tier_b=1, ttl=1000,
+                      salt="testsalt-reportlog-public-http")
+        registry = trust.Registry()
+        registry.issue("reportlog-pub-mod", "test-owner", trust.SCOPE_MODERATOR, SERVER, token=MODERATOR_TOKEN)
+        registry.issue("reportlog-pub-fleet", "test-owner", trust.SCOPE_FULL, SERVER, token=FULL_TOKEN)
+        links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8, require_ownership_proof=False)
+        auth = Auth(registry, links=links, bot_hashes={Auth.hash_token(BOT_TOKEN)},
+                    owner_hashes={Auth.hash_token(OWNER_TOKEN)})
+        cls.links = links
+        cls.app = App(store, auth)
+        cls.srv = Server(("127.0.0.1", 0), cls.app)
+        cls.port = cls.srv.server_address[1]
+        cls.net = store.networks[SERVER]
+        cls.map = store.map_hashes[SERVER]
+        cls.t = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.t.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+
+    def url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def a_report(self, x, cond="HOLE"):
+        return reference_client.build_report(x, 120, 0, "NETHER", self.net, self.map,
+                                             SERVER, cond=cond)
+
+    def link_and_get_token(self, mc_uid, discord_id):
+        code = self.links.init_link(mc_uid, SERVER)
+        _, token = self.links.complete_link(code, discord_id, discord_id.upper())
+        return token
+
+    def test_readable_with_no_credential_at_all(self):
+        status, _ = req("GET", self.url(f"/reports/{SERVER}/public"))
+        self.assertEqual(status, 200)
+
+    def test_tier_b_report_is_anonymous_by_default(self):
+        token = self.link_and_get_token("mc-reportlog-pub-1", "discord-reportlog-pub-1")
+        req("POST", self.url("/report"), token=token, body=self.a_report(16000))
+        status, body = req("GET", self.url(f"/reports/{SERVER}/public"))
+        self.assertEqual(status, 200)
+        row = next(r for r in body["reports"] if r["along"] == self.a_report(16000)["along"])
+        self.assertNotIn("discordId", row)
+        self.assertNotIn("mcUid", row)
+
+    def test_moderator_scope_still_gets_the_anonymous_view(self):
+        token = self.link_and_get_token("mc-reportlog-pub-2", "discord-reportlog-pub-2")
+        req("POST", self.url("/report"), token=token, body=self.a_report(16100))
+        status, body = req("GET", self.url(f"/reports/{SERVER}/public"), token=MODERATOR_TOKEN)
+        self.assertEqual(status, 200)
+        row = next(r for r in body["reports"] if r["along"] == self.a_report(16100)["along"])
+        self.assertNotIn("discordId", row)
+
+    def test_owner_admin_scope_also_gets_the_anonymous_view(self):
+        # Not even the Owner/admin sees identity through THIS route -- that's
+        # what /reports/<server> (moderator/admin/bot-gated) exists for.
+        token = self.link_and_get_token("mc-reportlog-pub-3", "discord-reportlog-pub-3")
+        req("POST", self.url("/report"), token=token, body=self.a_report(16200))
+        status, body = req("GET", self.url(f"/reports/{SERVER}/public"), token=OWNER_TOKEN)
+        self.assertEqual(status, 200)
+        row = next(r for r in body["reports"] if r["along"] == self.a_report(16200)["along"])
+        self.assertNotIn("discordId", row)
+        self.assertNotIn("mcUid", row)
+
+    def test_tier_a_and_m_never_appear_on_the_public_feed(self):
+        req("POST", self.url("/report"), token=FULL_TOKEN, body=self.a_report(16300))
+        status, body = req("GET", self.url(f"/reports/{SERVER}/public"), token=OWNER_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertFalse(any(r["along"] == self.a_report(16300)["along"] for r in body["reports"]))
+
+    def test_anonymous_tier_c_reports_never_appear(self):
+        req("POST", self.url("/report"), body=self.a_report(16600))
+        status, body = req("GET", self.url(f"/reports/{SERVER}/public"), token=OWNER_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertFalse(any(r["along"] == self.a_report(16600)["along"] for r in body["reports"]))
 
 
 if __name__ == "__main__":

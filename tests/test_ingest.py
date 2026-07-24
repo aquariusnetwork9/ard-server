@@ -22,10 +22,19 @@ class Clock:
         return self.t
 
 
+class _ZeroRand:
+    """Deterministic stand-in for Store's rand= -- every reveal-delay draw
+    comes out 0, so these tests (unrelated to the reveal-delay feature) keep
+    seeing conditions the instant they're ingested. See test_reveal_delay.py
+    for the feature's own dedicated tests."""
+    def uniform(self, lo, hi):
+        return 0.0
+
+
 class IngestTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
-        self.store = Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt")
+        self.store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt")
         self.net = self.store.networks[SERVER]
         self.map = self.store.map_hashes[SERVER]
 
@@ -146,7 +155,7 @@ class IngestTests(unittest.TestCase):
                              for v in self.store.query(SERVER)))
 
     def test_reopen_outside_window_is_not_flagged(self):
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, reopen_window=50, clock=self.clock, salt="testsalt")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, reopen_window=50, clock=self.clock, salt="testsalt")
         net, mh = store.networks[SERVER], store.map_hashes[SERVER]
 
         def r(cond):
@@ -207,6 +216,21 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(len(self.store.query(SERVER)), 1)
         self.clock.t += 1001  # past ttl
         self.assertEqual(self.store.query(SERVER), [], "expired conditions drop out")
+
+    def test_tier_b_survives_past_the_ordinary_ttl(self):
+        # This class's Store uses ttl=1000; TIER_TTL_OVERRIDE gives Tier B a
+        # 24h leash regardless, on the theory that a Tier B report's own decay
+        # was raised independently of every other tier's.
+        self.store.ingest(self.report(4100, 0), "discord-ttl-1", "B")
+        self.clock.t += 1001  # well past the ordinary ttl=1000
+        self.assertEqual(len(self.store.query(SERVER, include_unpublished=True)), 1,
+                         "a Tier B condition must not expire on the ordinary (short) ttl")
+
+    def test_tier_b_still_expires_after_24h(self):
+        self.store.ingest(self.report(4200, 0), "discord-ttl-2", "B")
+        self.clock.t += 24 * 3600 + 1
+        self.assertEqual(self.store.query(SERVER, include_unpublished=True), [],
+                         "Tier B's own 24h window still eventually expires it")
 
     def test_road_filter(self):
         self.store.ingest(self.report(5000, 0), "10.0.0.1", "A")   # z=0 axis
@@ -334,7 +358,7 @@ class ReputationTests(unittest.TestCase):
 
     def setUp(self):
         self.clock = Clock()
-        self.store = Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt")
+        self.store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt")
         self.net = self.store.networks[SERVER]
         self.map = self.store.map_hashes[SERVER]
 
@@ -414,7 +438,7 @@ class ReputationTests(unittest.TestCase):
         # alone stays under 1.8, but adding the penalized 0.85 crosses it (1.85).
         # That's what proves the boost lands on the identity whose own report actually
         # helped, not just "whoever happened to publish something" some other way.
-        store = Store(str(GEO_DIR), k_anon=1.8, ttl=1000, clock=self.clock, salt="testsalt")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=1.8, ttl=1000, clock=self.clock, salt="testsalt")
         net, mh = store.networks[SERVER], store.map_hashes[SERVER]
 
         def r(x, z, cond="HOLE"):
@@ -461,7 +485,7 @@ class StoreEventTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
         self.events = []
-        self.store = Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt",
+        self.store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt",
                            on_event=lambda kind, d: self.events.append((kind, d)))
         self.net = self.store.networks[SERVER]
         self.map = self.store.map_hashes[SERVER]
@@ -524,7 +548,7 @@ class PresenceCheckTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
         self.oracle = FakeOracle(present_uuids={"mc-uid-present"})
-        self.store = Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt",
+        self.store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt",
                            presence_oracles={SERVER: self.oracle})
         self.net = self.store.networks[SERVER]
         self.map = self.store.map_hashes[SERVER]
@@ -551,7 +575,7 @@ class PresenceCheckTests(unittest.TestCase):
 
     def test_unknown_oracle_verdict_costs_nothing(self):
         oracle = FakeOracle(always_none=True)
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt2",
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt2",
                      presence_oracles={SERVER: oracle})
         net, mh = store.networks[SERVER], store.map_hashes[SERVER]
         r = reference_client.build_report(3300, 120, 0, "NETHER", net, mh, SERVER,
@@ -562,7 +586,7 @@ class PresenceCheckTests(unittest.TestCase):
         self.assertAlmostEqual(store._get_trust(identity_hash), TRUST_BASELINE, "and must not penalize")
 
     def test_no_oracle_configured_for_server_is_a_no_op(self):
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt3")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt3")
         net, mh = store.networks[SERVER], store.map_hashes[SERVER]
         r = reference_client.build_report(3400, 120, 0, "NETHER", net, mh, SERVER,
                                           cond="HOLE", now=self.clock.t)
@@ -592,7 +616,7 @@ class IdentitySaltPersistenceTests(unittest.TestCase):
         self.clock = Clock()
 
     def store(self, salt, identity_salt):
-        return Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock,
+        return Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, clock=self.clock,
                      salt=salt, identity_salt=identity_salt)
 
     def test_identity_hash_ignores_the_source_hash_salt(self):
@@ -621,7 +645,7 @@ class IdentitySaltPersistenceTests(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             db_path = str(pathlib.Path(d) / "conditions.db")
-            store1 = Store(str(GEO_DIR), db_path=db_path, k_anon=2, ttl=1000,
+            store1 = Store(str(GEO_DIR), rand=_ZeroRand(), db_path=db_path, k_anon=2, ttl=1000,
                            clock=self.clock, salt="rotating-1", identity_salt="stable-salt")
             ih = store1._identity_hash(SERVER, "discord-1")
             store1._adjust_trust(ih, -TRUST_PENALTY, self.clock.t)
@@ -631,7 +655,7 @@ class IdentitySaltPersistenceTests(unittest.TestCase):
 
             # "Restart": a fresh Store, source-hash salt rotated (as it always
             # does), identity_salt held stable.
-            store2 = Store(str(GEO_DIR), db_path=db_path, k_anon=2, ttl=1000,
+            store2 = Store(str(GEO_DIR), rand=_ZeroRand(), db_path=db_path, k_anon=2, ttl=1000,
                            clock=self.clock, salt="rotating-2", identity_salt="stable-salt")
             try:
                 ih2 = store2._identity_hash(SERVER, "discord-1")
@@ -647,14 +671,14 @@ class IdentitySaltPersistenceTests(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             db_path = str(pathlib.Path(d) / "conditions.db")
-            store1 = Store(str(GEO_DIR), db_path=db_path, k_anon=2, ttl=1000,
+            store1 = Store(str(GEO_DIR), rand=_ZeroRand(), db_path=db_path, k_anon=2, ttl=1000,
                            clock=self.clock, identity_salt="salt-before-restart")
             ih = store1._identity_hash(SERVER, "discord-1")
             store1._adjust_trust(ih, -TRUST_PENALTY, self.clock.t)
             store1.db.commit()
             store1.db.close()
 
-            store2 = Store(str(GEO_DIR), db_path=db_path, k_anon=2, ttl=1000,
+            store2 = Store(str(GEO_DIR), rand=_ZeroRand(), db_path=db_path, k_anon=2, ttl=1000,
                            clock=self.clock, identity_salt="salt-after-restart")
             try:
                 ih2 = store2._identity_hash(SERVER, "discord-1")
@@ -673,7 +697,7 @@ class BroadcastPublishOnlyTests(unittest.TestCase):
 
     def setUp(self):
         self.clock = Clock()
-        self.store = Store(str(GEO_DIR), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt")
+        self.store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt")
         self.net = self.store.networks[SERVER]
         self.map = self.store.map_hashes[SERVER]
 
@@ -732,7 +756,7 @@ class DispatchQueueTests(unittest.TestCase):
 
     def setUp(self):
         self.clock = Clock()
-        self.store = Store(str(GEO_DIR), k_anon=2, ttl=10000, reopen_window=600,
+        self.store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=10000, reopen_window=600,
                            clock=self.clock, salt="testsalt",
                            dispatch_ttl=100000, dispatch_claim_timeout=500)
         self.net = self.store.networks[SERVER]
@@ -756,6 +780,17 @@ class DispatchQueueTests(unittest.TestCase):
         self.assertEqual(q[0]["id"], did)
         self.assertEqual(q[0]["status"], "queued")
         self.assertEqual(q[0]["trigger"], "manual")
+
+    def test_dispatch_entries_carry_rederived_coordinates(self):
+        # Without x/z, a dispatch entry is just an opaque road/seg/along triple --
+        # nothing a human reading the Discord embed can actually place on a map.
+        r = self.report(9000, 0)
+        self.store.enqueue_dispatch(SERVER, r["road"], r["seg"], r["along"], "manual")
+        entry = self.queue()[0]
+        self.assertIsInstance(entry["x"], float)
+        self.assertIsInstance(entry["z"], float)
+        self.assertAlmostEqual(entry["x"], 9000, delta=500)
+        self.assertAlmostEqual(entry["z"], 0, delta=500)
 
     def test_repeated_enqueue_is_idempotent_and_escalates_priority(self):
         r = self.report(9010, 0)

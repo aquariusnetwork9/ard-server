@@ -95,10 +95,19 @@ def session_cookie(headers):
     return None
 
 
+class _ZeroRand:
+    """Deterministic stand-in for Store's rand= -- every reveal-delay draw
+    comes out 0, so these tests (unrelated to the reveal-delay feature) keep
+    seeing conditions/dispatch entries the instant they're ingested/enqueued.
+    See test_reveal_delay.py for the feature's own dedicated tests."""
+    def uniform(self, lo, hi):
+        return 0.0
+
+
 class HttpTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt")
         registry = trust.Registry()
         registry.issue("fleet-bot-1", "test-owner", trust.SCOPE_FULL, SERVER, token=FULL_TOKEN)
         registry.issue("highway-crew-1", "test-owner", trust.SCOPE_MAINTAINER, SERVER, token=MAINTAINER_TOKEN)
@@ -523,6 +532,91 @@ class HttpTests(unittest.TestCase):
                        body={"names": "not-an-object"})
         self.assertEqual(code, 400)
 
+    def test_identity_tier_requires_admin_not_just_moderator(self):
+        self.assertEqual(
+            req("POST", self.url(f"/identity/{SERVER}/discord-user-1/tier"),
+                token=MODERATOR_TOKEN, body={"tier": "A"})[0], 403)
+        self.assertEqual(
+            req("POST", self.url(f"/identity/{SERVER}/discord-user-1/tier"),
+                token=FULL_TOKEN, body={"tier": "A"})[0], 403)
+
+    def test_identity_tier_rejects_bad_value(self):
+        code, _ = req("POST", self.url(f"/identity/{SERVER}/discord-user-1/tier"),
+                       token=OWNER_TOKEN, body={"tier": "Z"})
+        self.assertEqual(code, 400)
+
+    def test_identity_tier_upgrade_to_full_mints_a_working_token(self):
+        code = self.links.init_link("mc-uid-tier-a", SERVER)
+        self.links.complete_link(code, "discord-tier-a")
+
+        status, body = req("POST", self.url(f"/identity/{SERVER}/discord-tier-a/tier"),
+                            token=OWNER_TOKEN, body={"tier": "A"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["tier"], "A")
+        new_token = body["token"]
+
+        r = self.a_report(cond="CLEAR", x=6100)
+        status, report_body = req("POST", self.url("/report"), token=new_token, body=r)
+        self.assertEqual(report_body["tiers"], ["A"], "the minted token really is a live Tier A credential")
+
+        _, roster = req("GET", self.url(f"/identities/{SERVER}"), token=MODERATOR_TOKEN)
+        row = next(rr for rr in roster["identities"] if rr["discordId"] == "discord-tier-a")
+        self.assertEqual(row["tier"], "A")
+        self.assertEqual(row["tierTokenId"], body["tokenId"])
+
+    def test_identity_tier_downgrade_to_c_revokes_any_am_token_and_suspends(self):
+        code = self.links.init_link("mc-uid-tier-down", SERVER)
+        self.links.complete_link(code, "discord-tier-down")
+        _, up = req("POST", self.url(f"/identity/{SERVER}/discord-tier-down/tier"),
+                     token=OWNER_TOKEN, body={"tier": "M"})
+        am_token = up["token"]
+
+        status, body = req("POST", self.url(f"/identity/{SERVER}/discord-tier-down/tier"),
+                            token=OWNER_TOKEN, body={"tier": "C"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["revokedTokens"], 1)
+
+        r = self.a_report(cond="CLEAR", x=6110)
+        status, report_body = req("POST", self.url("/report"), token=am_token, body=r)
+        self.assertEqual(status, 200, "/report never 401s -- an unrecognized token just falls back")
+        self.assertEqual(report_body["tiers"], ["C"], "the old Tier M token no longer resolves to anything")
+
+        _, roster = req("GET", self.url(f"/identities/{SERVER}"), token=MODERATOR_TOKEN)
+        row = next(rr for rr in roster["identities"] if rr["discordId"] == "discord-tier-down")
+        self.assertEqual(row["tier"], "C")
+        self.assertTrue(row["suspended"])
+
+    def test_identity_tier_reissue_replaces_the_previous_am_token(self):
+        code = self.links.init_link("mc-uid-tier-swap", SERVER)
+        self.links.complete_link(code, "discord-tier-swap")
+        _, first = req("POST", self.url(f"/identity/{SERVER}/discord-tier-swap/tier"),
+                        token=OWNER_TOKEN, body={"tier": "M"})
+        status, second = req("POST", self.url(f"/identity/{SERVER}/discord-tier-swap/tier"),
+                              token=OWNER_TOKEN, body={"tier": "A"})
+        self.assertEqual(status, 200)
+        self.assertEqual(second["revokedTokens"], 1, "the earlier M token is revoked on the A re-grant")
+
+        r = self.a_report(cond="CLEAR", x=6120)
+        status, first_report_body = req("POST", self.url("/report"), token=first["token"], body=r)
+        self.assertEqual(status, 200)
+        self.assertEqual(first_report_body["tiers"], ["C"], "superseded token no longer resolves to M")
+        status, report_body = req("POST", self.url("/report"), token=second["token"], body=r)
+        self.assertEqual(report_body["tiers"], ["A"])
+
+    def test_identity_tier_back_to_b_reinstates_a_suspended_identity(self):
+        code = self.links.init_link("mc-uid-tier-b", SERVER)
+        self.links.complete_link(code, "discord-tier-b")
+        self.links.suspend("discord-tier-b", SERVER)
+
+        status, body = req("POST", self.url(f"/identity/{SERVER}/discord-tier-b/tier"),
+                            token=OWNER_TOKEN, body={"tier": "B"})
+        self.assertEqual(status, 200)
+
+        _, roster = req("GET", self.url(f"/identities/{SERVER}"), token=MODERATOR_TOKEN)
+        row = next(rr for rr in roster["identities"] if rr["discordId"] == "discord-tier-b")
+        self.assertEqual(row["tier"], "B")
+        self.assertFalse(row["suspended"])
+
     def test_moderator_suspend_demotes_tier_b_to_anonymous(self):
         # Dedicated identity (good-code-3), never touched by other tests -- suspend
         # actions are shared state (cls.links persists across the whole class), so
@@ -586,7 +680,7 @@ class AdminDashboardTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-admin")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt-admin")
         registry = trust.Registry()
         registry.grant_to_discord("discord-admin-1", trust.SCOPE_ADMIN, SERVER, "test-owner")
         registry.grant_to_discord("discord-mod-1", trust.SCOPE_MODERATOR, SERVER, "test-owner")
@@ -734,7 +828,7 @@ class BotLinkTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-bot")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt-bot")
         registry = trust.Registry()
         links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8, require_ownership_proof=False)
         auth = Auth(registry, links=links, owner_hashes={Auth.hash_token(OWNER_TOKEN)},
@@ -818,7 +912,7 @@ class OwnershipProofHttpTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-ownership")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt-ownership")
         registry = trust.Registry()
         cls.links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8)
         auth = Auth(registry, links=cls.links, bot_hashes={Auth.hash_token(BOT_TOKEN)})
@@ -904,7 +998,7 @@ class BotLinkRateLimitTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-bot-rl")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt-bot-rl")
         registry = trust.Registry()
         links = identity.LinkStore(link_code_ttl=600, max_linked_uids=8, require_ownership_proof=False)
         auth = Auth(registry, links=links, bot_hashes={Auth.hash_token(BOT_TOKEN)})
@@ -939,7 +1033,7 @@ class LinkConfigUnconfiguredTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt2")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt2")
         auth = Auth(trust.Registry())
         cls.app = App(store, auth)  # no discord_client_id/redirect_uri/verify at all
         cls.srv = Server(("127.0.0.1", 0), cls.app)
@@ -967,14 +1061,14 @@ class TrustedProxyTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-proxy-trusted")
+        cls.store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt-proxy-trusted")
         cls.trusting_app = App(cls.store, Auth(trust.Registry()))  # default trusted_proxies (loopback)
         cls.trusting_srv = Server(("127.0.0.1", 0), cls.trusting_app)
         cls.trusting_port = cls.trusting_srv.server_address[1]
         cls.trusting_t = threading.Thread(target=cls.trusting_srv.serve_forever, daemon=True)
         cls.trusting_t.start()
 
-        cls.store2 = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-proxy-untrusted")
+        cls.store2 = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt-proxy-untrusted")
         cls.untrusting_app = App(cls.store2, Auth(trust.Registry()), trusted_proxies=[])
         cls.untrusting_srv = Server(("127.0.0.1", 0), cls.untrusting_app)
         cls.untrusting_port = cls.untrusting_srv.server_address[1]
@@ -1020,7 +1114,7 @@ class TrustedWriteCapTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import notify as notify_mod
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-cap")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt-cap")
         registry = trust.Registry()
         registry.issue("cap-bot", "test-owner", trust.SCOPE_FULL, SERVER, token=FULL_TOKEN)
         registry.issue("cap-crew", "test-owner", trust.SCOPE_MAINTAINER, SERVER, token=MAINTAINER_TOKEN)
@@ -1087,7 +1181,7 @@ class DispatchHttpTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-dispatch")
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt-dispatch")
         registry = trust.Registry()
         registry.issue("dispatch-bot", "test-owner", trust.SCOPE_FULL, SERVER, token=FULL_TOKEN)
         registry.issue("dispatch-crew", "test-owner", trust.SCOPE_MAINTAINER, SERVER, token=MAINTAINER_TOKEN)

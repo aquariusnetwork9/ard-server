@@ -18,12 +18,12 @@
 
   // Roads already have a sensible, hand-curated name in the geometry data
   // itself (e.g. "7.5k ringroad (7x4, y113)", "farlands ringroad (3x3)",
-  // "Cardinals (6x4) + Diagonals (7x4) dug") -- strip a trailing "(dig
-  // dimensions[, note])" suffix and normalize "ring road"/"ringroad" to "RR"
-  // rather than re-deriving a label from the raw radius, which reads badly
-  // for the handful of rings that aren't a round number of blocks (the
-  // farlands ring is ~1,568,852 out -- "1568.9k RR" is much worse than the
-  // name's own "farlands").
+  // "Highway Axis (dug)") -- strip a trailing "(dig dimensions[, note])"
+  // suffix and normalize "ring road"/"ringroad" to "RR" rather than
+  // re-deriving a label from the raw radius, which reads badly for the
+  // handful of rings that aren't a round number of blocks (the farlands
+  // ring is ~1,568,852 out -- "1568.9k RR" is much worse than the name's
+  // own "farlands").
   function roadLabel(name) {
     var base = name.replace(/\s*\([^)]*\)\s*$/, "").trim();
     return base.replace(/ring\s?road/i, "RR").replace(/\s+/g, " ").trim();
@@ -31,10 +31,10 @@
 
   // The "axis" category combines all 8 cardinal/diagonal rays (each running
   // BOTH directions through spawn) into just 2 road entries (dug/paved), so
-  // their own name ("Cardinals (6x4) + Diagonals (7x4) dug") is really just
-  // dig-width metadata, not something to show as a road name -- a compass
-  // direction, taken straight from which side of spawn is actually on screen,
-  // is what's actually useful while traveling one of these.
+  // their own name ("Highway Axis (dug)") is really just a build-quality
+  // label, not something to show as a road name -- a compass direction,
+  // taken straight from which side of spawn is actually on screen, is what's
+  // actually useful while traveling one of these.
   function compassLabel(x, z) {
     var ns = z < 0 ? "N" : z > 0 ? "S" : "";
     var ew = x > 0 ? "E" : x < 0 ? "W" : "";
@@ -116,6 +116,7 @@
   var eventSource = null;
   var refreshTimer = null;
   var refreshPending = false;
+  var activityTimer = null;
 
   function buildLegend() {
     legendItems.innerHTML = "";
@@ -284,16 +285,44 @@
     eventSource.onerror = function () { setConn("stale", "live stream reconnecting…"); };
   }
 
+  // ALWAYS anonymous -- the server never sends identity on this route at all,
+  // for any caller, so there's nothing here to conditionally show. Nobody
+  // should be able to use this feed to correlate report events into "the same
+  // traveler" and infer who was where, in what direction.
+  function refreshActivity() {
+    if (!currentServer) return;
+    fetchJSON("/reports/" + encodeURIComponent(currentServer) + "/public?limit=20")
+      .then(function (data) {
+        var el = document.getElementById("activity-items");
+        var rows = data.reports || [];
+        el.innerHTML = "";
+        if (!rows.length) { el.innerHTML = "<div class=\"activity-empty\">nothing recent</div>"; return; }
+        rows.forEach(function (r) {
+          var s = COND_STYLE[r.cond] || DEFAULT_STYLE;
+          var road = roadsForLabels[r.road] ? roadsForLabels[r.road].text : "road #" + r.road;
+          var row = document.createElement("div");
+          row.className = "activity-row";
+          row.innerHTML = "<b>" + s.label + "</b> @ " + road + " seg " + r.seg
+            + " · " + agoString(r.createdAt);
+          el.appendChild(row);
+        });
+      })
+      .catch(function () { /* best-effort -- the map itself doesn't depend on this */ });
+  }
+
   function loadServer(server) {
     currentServer = server;
     if (refreshTimer) clearInterval(refreshTimer);
+    if (activityTimer) clearInterval(activityTimer);
     setConn("stale", "loading " + server + "…");
     fetchJSON("/geometry/" + encodeURIComponent(server))
       .then(function (geo) {
         drawRoads(geo);
         refreshConditions();
+        refreshActivity();
         connectStream(server);
         refreshTimer = setInterval(refreshConditions, 20000);
+        activityTimer = setInterval(refreshActivity, 30000);
       })
       .catch(function () { setConn("down", "couldn't load geometry for " + server); });
   }

@@ -26,6 +26,7 @@ import ipaddress
 import json
 import os
 import queue
+import random
 import re
 import secrets
 import sqlite3
@@ -166,6 +167,33 @@ def validate_moderation(obj):
 _TIER_RANK = {"C": 0, "B": 1, "A": 2, "M": 3}
 _CORROBORATED_TIERS = {"B", "C"}  # tiers subject to the reputation layer below
 
+# Reveal delay: every report sits for a randomized window before it appears
+# ANYWHERE -- the public map, the bot's mod-only radar feed, and the dispatch
+# queue all wait equally (this is a display gate, not a publish/corroboration
+# one -- see the visible_at plumbing in ingest()/query()/list_dispatch). A
+# Tier B/C report is a specific traveler's own live position; Tier A/M is a
+# registry-vetted holder's report, already a step removed from "here's exactly
+# where one person is right now" -- hence the shorter window.
+REVEAL_DELAY_RANGE = {
+    "C": (45 * 60, 90 * 60), "B": (45 * 60, 90 * 60),
+    "A": (10 * 60, 25 * 60), "M": (10 * 60, 25 * 60),
+}
+
+# A SECOND, independent delay stacked on top of REVEAL_DELAY_RANGE above, but
+# ONLY for the public map (public /conditions, its /stream, and the public
+# per-report feed below) -- never the mod/bot-only /all feed, dispatch queue,
+# or the admin dashboard's /reports. Same tier-agnostic window for every
+# report; drawn once at a condition's creation (see ingest()'s INSERT branch)
+# and never redrawn on corroboration, unlike the tier-based delay.
+PUBLIC_EXTRA_DELAY_RANGE = (10 * 60, 20 * 60)
+
+# Per-tier override of Store.ttl -- currently only Tier B, given a much longer
+# leash (24h) than the default window every other tier still uses. Looked up
+# by a condition's own (possibly merged/upgraded) `tier` column, so a Tier C
+# report that later gets a Tier B corroboration starts decaying on this
+# longer clock from then on, same as any other tier-upgrade effect here.
+TIER_TTL_OVERRIDE = {"B": 24 * 3600}
+
 
 def _auto_publishes(tier, cond):
     """Does a report at this tier publish without corroboration for this cond?"""
@@ -203,8 +231,11 @@ class Store:
                  k_anon=4, k_tier_b=2, ttl=3600, clear_factor=2, reopen_window=3600,
                  salt=None, clock=time.time, max_travel_speed=MAX_TRAVEL_SPEED_DEFAULT,
                  on_event=None, presence_oracles=None, identity_salt=None,
-                 dispatch_ttl=86400, dispatch_claim_timeout=7200):
+                 dispatch_ttl=86400, dispatch_claim_timeout=7200, rand=None):
         self.bucket = bucket
+        # Draws the reveal-delay jitter (REVEAL_DELAY_RANGE) -- injectable so
+        # tests get deterministic offsets the same way clock is injectable.
+        self.rand = rand or random.Random()
         self.k_anon = k_anon      # Tier C (anonymous, IP-hash) corroboration threshold
         self.k_tier_b = k_tier_b  # Tier B (Discord-verified identity) threshold -- lower than
         # k_anon (PROTOCOL.md K_TIER_B_NEW)
@@ -323,11 +354,39 @@ class Store:
           kind TEXT NOT NULL DEFAULT 'report', awarded_at REAL NOT NULL,
           UNIQUE(cond_id, discord_id, kind)
         );
+        CREATE TABLE IF NOT EXISTS report_log(
+          id INTEGER PRIMARY KEY,
+          server TEXT NOT NULL, cond_id INTEGER NOT NULL, tier TEXT NOT NULL,
+          discord_id TEXT, token_id TEXT, mc_uid TEXT,
+          counts_toward_corroboration INTEGER NOT NULL, created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS report_log_server_time ON report_log(server, created_at);
         """)
         # sources.weight didn't exist before the reputation layer -- ALTER, not
         # CREATE, since a live deployment's DB already has this table without it.
         self._ensure_column("sources", "weight", "REAL NOT NULL DEFAULT 1.0")
+        # visible_at: reveal-delay gate (REVEAL_DELAY_RANGE). Backfilled to 0 for
+        # any pre-existing row (an already-live deployment's history) so nothing
+        # already on the map retroactively vanishes -- the delay only ever
+        # applies going forward, from here on out.
+        self._ensure_column("conditions", "visible_at", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("dispatch", "visible_at", "REAL NOT NULL DEFAULT 0")
+        # public_delay_extra: PUBLIC_EXTRA_DELAY_RANGE, drawn once at creation --
+        # 0 backfill for pre-existing rows, same "never retroactively vanish"
+        # reasoning as visible_at above.
+        self._ensure_column("conditions", "public_delay_extra", "REAL NOT NULL DEFAULT 0")
         self.db.commit()
+
+    def _draw_reveal_delay(self, tier):
+        lo, hi = REVEAL_DELAY_RANGE[tier]
+        return self.rand.uniform(lo, hi)
+
+    def _draw_public_extra_delay(self):
+        lo, hi = PUBLIC_EXTRA_DELAY_RANGE
+        return self.rand.uniform(lo, hi)
+
+    def _effective_ttl(self, tier):
+        return TIER_TTL_OVERRIDE.get(tier, self.ttl)
 
     def _ensure_column(self, table, column, coldef):
         cols = [r[1] for r in self.db.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -407,13 +466,13 @@ class Store:
         except Exception:
             pass
 
-    def _safe_enqueue_dispatch(self, server, road_idx, seg, along, trigger):
+    def _safe_enqueue_dispatch(self, server, road_idx, seg, along, trigger, tier=None):
         """road_idx/seg/along are already validated by this exact ingest() call --
         enqueue_dispatch's own validation is redundant in practice. Swallow
         anything anyway, same posture as _emit: a dispatch-queue hiccup must
         never fail the ingest that triggered it."""
         try:
-            self.enqueue_dispatch(server, road_idx, seg, along, trigger)
+            self.enqueue_dispatch(server, road_idx, seg, along, trigger, tier=tier)
         except Exception:
             pass
 
@@ -592,10 +651,14 @@ class Store:
                 " WHERE server=? AND road_canon=? AND seg=? AND along=? AND cond=?",
                 (server, canon, seg, along, cond)).fetchone()
             if row is None:
+                visible_at = now + self._draw_reveal_delay(tier)
+                public_delay_extra = self._draw_public_extra_delay()
                 cur = self.db.execute(
                     "INSERT INTO conditions(server,road_canon,seg,along,cond,tier,reports,"
-                    "first_seen,last_seen,lane_min,lane_max) VALUES(?,?,?,?,?,?,1,?,?,?,?)",
-                    (server, canon, seg, along, cond, tier, now, now, lane_min, lane_max))
+                    "first_seen,last_seen,lane_min,lane_max,visible_at,public_delay_extra)"
+                    " VALUES(?,?,?,?,?,?,1,?,?,?,?,?,?)",
+                    (server, canon, seg, along, cond, tier, now, now, lane_min, lane_max,
+                     visible_at, public_delay_extra))
                 cond_id = cur.lastrowid
             else:
                 cond_id, cur_tier, prev_min, prev_max = row
@@ -603,14 +666,45 @@ class Store:
                 # Union corroborating lane spans: widen, never narrow, as more reporters confirm.
                 new_min = lane_min if prev_min is None else (lane_min if lane_min is None else min(prev_min, lane_min))
                 new_max = lane_max if prev_max is None else (lane_max if lane_max is None else max(prev_max, lane_max))
+                params = [now, new_tier, new_min, new_max]
+                # A strictly better-tier corroboration can only PULL the reveal
+                # time forward, never push it back -- e.g. an anonymous-only
+                # hazard that a fleet Tier M report then confirms should surface
+                # on that shorter window from right now, not stay hidden on the
+                # original (longer) Tier C draw. A same-or-worse-tier re-report
+                # never touches it -- re-sending the same tier can't reset or
+                # extend the timer.
+                set_visible_at = ""
+                if _TIER_RANK[tier] > _TIER_RANK[cur_tier]:
+                    candidate = now + self._draw_reveal_delay(tier)
+                    set_visible_at = ", visible_at=MIN(visible_at, ?)"
+                    params.append(candidate)
+                params.append(cond_id)
                 self.db.execute(
                     "UPDATE conditions SET reports=reports+1, last_seen=?, tier=?, lane_min=?, lane_max=?"
-                    " WHERE id=?",
-                    (now, new_tier, new_min, new_max, cond_id))
+                    + set_visible_at + " WHERE id=?",
+                    params)
             if counts_toward_corroboration:
                 self.db.execute(
                     "INSERT OR REPLACE INTO sources(cond_id, src_hash, seen, weight) VALUES(?,?,?,?)",
                     (cond_id, src, now, weight))
+            if tier in ("A", "M", "B"):
+                # Per-report audit log, Tier B and above only -- Tier C (anonymous)
+                # has no identity to log in the first place, and logging it would
+                # add nothing an admin could act on. source_key IS the discord_id
+                # for Tier B (see the tier-resolution note atop this method); for
+                # A/M it's "tok:<token_id>" -- strip the prefix to get the holder's
+                # own registry token id. This is a genuine, deliberate exception to
+                # the "no identity-to-report link" privacy stance described above
+                # (SS6.2/Survey credit) -- added specifically so admins can see who
+                # reported what, scoped to non-anonymous tiers only.
+                self.db.execute(
+                    "INSERT INTO report_log(server,cond_id,tier,discord_id,token_id,mc_uid,"
+                    "counts_toward_corroboration,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (server, cond_id, tier,
+                     source_key if tier == "B" else None,
+                     source_key[4:] if tier in ("A", "M") else None,
+                     mc_uid, 1 if counts_toward_corroboration else 0, now))
             self.db.commit()
             view = self._view_by_id(net, cond_id, now)
             # Positive reinforcement: this report helped corroborate a condition that IS
@@ -645,35 +739,42 @@ class Store:
             self.add_moderation(report, kind="reopen")
             self._emit("reopen", {"server": server, "road": report["road"],
                                    "seg": seg, "along": along, "cond": cond})
-            self._safe_enqueue_dispatch(server, report["road"], seg, along, "reopen")
+            self._safe_enqueue_dispatch(server, report["road"], seg, along, "reopen", tier=tier)
         if fresh_hazard_before and not raised_this_hazard_itself and view["published"]:
-            self._safe_enqueue_dispatch(server, report["road"], seg, along, "conflict")
+            self._safe_enqueue_dispatch(server, report["road"], seg, along, "conflict", tier=tier)
             self._emit("dispatch_conflict", {"server": server, "road": report["road"],
                                               "seg": seg, "along": along})
         if view["published"] and view["tier"] == "C":
-            self._safe_enqueue_dispatch(server, report["road"], seg, along, "low_trust")
+            self._safe_enqueue_dispatch(server, report["road"], seg, along, "low_trust", tier=tier)
         if tier in ("A", "M"):
             self._maybe_resolve_dispatch(server, canon, seg, along, now)
-        if view["published"]:
-            # Only ever stream published-state views. An unpublished (tentative,
-            # below-threshold) view still carries distinctSources/confidence/
-            # cond/road/seg/along -- broadcasting it regardless of publish state
-            # would hand any SSE subscriber a live readout of exactly how close a
-            # given spot is to crossing the corroboration threshold, and exactly
-            # when a specific report landed, neither of which /conditions itself
-            # ever exposes (query() only ever returns published rows by default).
+        # The SSE stream is exclusively a PUBLIC surface (no auth on /stream at
+        # all -- see _conditions_stream), so it gates on visiblePublic, the same
+        # full delay (tier-based + PUBLIC_EXTRA_DELAY_RANGE) query(public=True)
+        # applies -- not the shorter "visible" the mod/bot-only /all feed uses.
+        if view["published"] and view.pop("visiblePublic"):
+            # Only ever stream published AND revealed views. An unpublished
+            # (tentative, below-threshold) view still carries distinctSources/
+            # confidence/cond/road/seg/along -- broadcasting it regardless of
+            # publish state would hand any SSE subscriber a live readout of
+            # exactly how close a given spot is to crossing the corroboration
+            # threshold, and exactly when a specific report landed, neither of
+            # which /conditions itself ever exposes (query() only ever returns
+            # published rows by default).
             self._broadcast(server, view)
+        view.pop("visible", None)
+        view.pop("visiblePublic", None)
         return view
 
     def _view_by_id(self, net, cond_id, now):
         r = self.db.execute(
-            "SELECT id,server,road_canon,seg,along,cond,tier,reports,first_seen,last_seen,lane_min,lane_max"
-            " FROM conditions WHERE id=?", (cond_id,)).fetchone()
+            "SELECT id,server,road_canon,seg,along,cond,tier,reports,first_seen,last_seen,"
+            "lane_min,lane_max,visible_at,public_delay_extra FROM conditions WHERE id=?", (cond_id,)).fetchone()
         return self._row_view(net, r, now)
 
     def _row_view(self, net, r, now):
         (cond_id, server, canon, seg, along, cond, tier, reports, first_seen, last_seen,
-         lane_min, lane_max) = r
+         lane_min, lane_max, visible_at, public_delay_extra) = r
         # A CLEAR needs K_CLEAR_FACTOR x the normal threshold (PROTOCOL.md SS6.4). The
         # non-overlap half of SS6.4 (a source can't both raise and resolve the same
         # hazard) is enforced at ingest time instead -- see _reported_a_hazard_here --
@@ -688,7 +789,7 @@ class Store:
         weight = self._corroboration_weight(cond_id, now)
         published = _auto_publishes(tier, cond) or (weight >= k_req)
         age = now - last_seen
-        recency = max(0.0, 1.0 - age / self.ttl)
+        recency = max(0.0, 1.0 - age / self._effective_ttl(tier))
         strength = 1.0 if _auto_publishes(tier, cond) else min(1.0, weight / max(1, k_req))
         conf = round(strength * recency, 3)
         road_idx = net["_canon2idx"].get(canon)
@@ -701,9 +802,23 @@ class Store:
             "laneMin": lane_min, "laneMax": lane_max,
             "tier": tier, "reports": reports, "distinctSources": ds, "confidence": conf,
             "published": published, "firstSeen": int(first_seen), "lastSeen": int(last_seen),
+            # Internal-only gates (anti-tracking reveal delay) -- callers strip
+            # both before anything reaches an external response. "visible" gates
+            # every feed (public AND mod/bot alike); "visiblePublic" ALSO
+            # requires PUBLIC_EXTRA_DELAY_RANGE to have elapsed, and is checked
+            # only by the public-facing paths (query(public=True), the SSE
+            # broadcast, and list_report_log_public) -- the mod/bot-only /all
+            # feed and the admin dashboard's /reports never look at it.
+            "visible": now >= visible_at,
+            "visiblePublic": now >= visible_at + public_delay_extra,
         }
 
-    def query(self, server, road_idx=None, frm=None, to=None, include_unpublished=False):
+    def query(self, server, road_idx=None, frm=None, to=None, include_unpublished=False, public=False):
+        """public=True is for the actual public-facing routes (/conditions,
+        the SSE stream) -- it ALSO requires PUBLIC_EXTRA_DELAY_RANGE to have
+        elapsed on top of the ordinary tier-based reveal delay. The mod/bot-only
+        /conditions/<server>/all leaves this False, so it only ever waits on
+        the shorter, tier-based delay."""
         net = self.networks.get(server)
         if net is None:
             raise KeyError(server)
@@ -713,10 +828,16 @@ class Store:
             if not (0 <= road_idx < len(net["roads"])):
                 raise ValueError("road out of range")
             canon_filter = net["_canon"][road_idx]
+        # The SQL cutoff has to use the WIDEST possible ttl (self.ttl plus any
+        # TIER_TTL_OVERRIDE) so a Tier B row surviving on its own longer window
+        # isn't excluded before _row_view even sees its real tier; the PRECISE
+        # per-tier cutoff is re-checked per row just below, using _effective_ttl.
+        widest_ttl = max([self.ttl] + list(TIER_TTL_OVERRIDE.values()))
         with self._lock:
             q = ("SELECT id,server,road_canon,seg,along,cond,tier,reports,first_seen,last_seen,"
-                 "lane_min,lane_max FROM conditions WHERE server=? AND last_seen>=?")
-            args = [server, now - self.ttl]
+                 "lane_min,lane_max,visible_at,public_delay_extra FROM conditions"
+                 " WHERE server=? AND last_seen>=?")
+            args = [server, now - widest_ttl]
             if canon_filter is not None:
                 q += " AND road_canon=?"
                 args.append(canon_filter)
@@ -725,6 +846,21 @@ class Store:
         for r in rows:
             canon, raw_last_seen = r[2], r[9]
             v = self._row_view(net, r, now)
+            if now - raw_last_seen > self._effective_ttl(v["tier"]):
+                continue  # past this tier's own decay window (TIER_TTL_OVERRIDE)
+            # Reveal delay (REVEAL_DELAY_RANGE, + PUBLIC_EXTRA_DELAY_RANGE for
+            # public=True): gates EVERY external read path alike -- the public
+            # feed and the bot/moderator-only /all feed both go through query(),
+            # so neither gets early visibility. Both flags popped rather than
+            # left in the dict since every row that survives this is trivially
+            # True for whichever gate(s) applied -- a constant, meaningless
+            # field on the wire.
+            visible = v.pop("visible")
+            visible_public = v.pop("visiblePublic")
+            if not visible:
+                continue
+            if public and not visible_public:
+                continue
             if frm is not None and v["along"] < frm:
                 continue
             if to is not None and v["along"] > to:
@@ -830,11 +966,19 @@ class Store:
         proximity = 1.0 / (1.0 + dist / geometry.NEAR_SPAWN_RADIUS)
         return round(base * proximity, 4)
 
-    def enqueue_dispatch(self, server, road_idx, seg, along, trigger, now=None):
+    def enqueue_dispatch(self, server, road_idx, seg, along, trigger, now=None, tier=None):
         """Idempotent: at most one OPEN (queued/claimed) entry per spatial key,
         enforced by dispatch_open_key. A repeated trigger for a spot that's
         already queued just escalates its priority instead of piling up
-        duplicates. Returns the (possibly pre-existing) dispatch id."""
+        duplicates. Returns the (possibly pre-existing) dispatch id.
+
+        `tier`, when given (every auto-trigger from ingest() passes the tier
+        that caused it; the manual-queue HTTP path leaves it None), draws this
+        entry's own reveal delay the same way conditions.visible_at works --
+        the dispatch queue is itself a "private" display surface (Discord
+        volunteers watching it live), so it gets the same anti-tracking gate.
+        None means immediately visible -- a moderator manually queuing a spot
+        has already decided to expose it now."""
         net = self.networks.get(server)
         if net is None:
             raise KeyError(server)
@@ -843,6 +987,7 @@ class Store:
         canon = net["_canon"][road_idx]
         now = now if now is not None else self.clock()
         priority = self._dispatch_priority(net, road_idx, seg, along, trigger)
+        visible_at = now if tier is None else now + self._draw_reveal_delay(tier)
         with self._lock:
             row = self.db.execute(
                 "SELECT id, priority FROM dispatch WHERE server=? AND road_canon=? AND seg=?"
@@ -853,12 +998,17 @@ class Store:
                 if priority > prev_priority:
                     self.db.execute("UPDATE dispatch SET priority=?, trigger=? WHERE id=?",
                                     (priority, trigger, did))
-                    self.db.commit()
+                if tier is not None:
+                    # Same forward-only rule as conditions.visible_at -- a better-
+                    # tier retrigger can only pull this entry's reveal sooner.
+                    self.db.execute("UPDATE dispatch SET visible_at=MIN(visible_at, ?) WHERE id=?",
+                                    (visible_at, did))
+                self.db.commit()
                 return did
             cur = self.db.execute(
-                "INSERT INTO dispatch(server,road_canon,seg,along,trigger,priority,status,created)"
-                " VALUES(?,?,?,?,?,?,'queued',?)",
-                (server, canon, seg, along, trigger, priority, now))
+                "INSERT INTO dispatch(server,road_canon,seg,along,trigger,priority,status,created,visible_at)"
+                " VALUES(?,?,?,?,?,?,'queued',?,?)",
+                (server, canon, seg, along, trigger, priority, now, visible_at))
             self.db.commit()
             return cur.lastrowid
 
@@ -884,16 +1034,120 @@ class Store:
         with self._lock:
             self._sweep_dispatch(server, now)
             rows = self.db.execute(
-                "SELECT id,road_canon,seg,along,trigger,priority,status,claimed_by,created,claimed_at"
+                "SELECT id,road_canon,seg,along,trigger,priority,status,claimed_by,created,claimed_at,visible_at"
                 " FROM dispatch WHERE server=? AND status IN ('queued','claimed')"
                 " ORDER BY priority DESC, created ASC",
                 (server,)).fetchall()
         canon2idx = net["_canon2idx"]
-        return [{
-            "id": r[0], "road": canon2idx.get(r[1]), "seg": r[2], "along": r[3],
-            "trigger": r[4], "priority": r[5], "status": r[6], "claimedBy": r[7],
-            "created": int(r[8]), "claimedAt": None if r[9] is None else int(r[9]),
-        } for r in rows]
+        out = []
+        for r in rows:
+            if now < r[10]:
+                # Reveal delay (REVEAL_DELAY_RANGE) -- same anti-tracking gate as
+                # conditions.visible_at, applied here too since the dispatch queue
+                # is itself a "private" display surface (Discord volunteers/fleet
+                # bots watching it live).
+                continue
+            road_idx = canon2idx.get(r[1])
+            seg = r[2]
+            x = z = None
+            if road_idx is not None and seg < len(net["roads"][road_idx]["segments"]):
+                x, z = rederive(net, road_idx, seg, r[3], self.bucket)
+            out.append({
+                "id": r[0], "road": road_idx, "seg": seg, "along": r[3],
+                "x": None if x is None else round(x, 1), "z": None if z is None else round(z, 1),
+                "trigger": r[4], "priority": r[5], "status": r[6], "claimedBy": r[7],
+                "created": int(r[8]), "claimedAt": None if r[9] is None else int(r[9]),
+            })
+        return out
+
+    # ---- per-report audit log (Tier B+ only -- see ingest()'s report_log insert) ----
+    def list_report_log(self, server, since=None, limit=200):
+        """Every Tier B/A/M report event on this server, newest first, capped at
+        `limit` -- deliberately excludes Tier C (anonymous) entirely, since
+        there's no identity to log for those and this exists specifically so an
+        admin can see who reported what. Each row is joined live against
+        `conditions` for its road/seg/along/cond -- never denormalized, so
+        there's exactly one place (ingest()) that decides what a report event
+        looks like."""
+        net = self.networks.get(server)
+        if net is None:
+            raise KeyError(server)
+        with self._lock:
+            q = ("SELECT rl.id, rl.tier, rl.discord_id, rl.token_id, rl.mc_uid,"
+                 " rl.counts_toward_corroboration, rl.created_at,"
+                 " c.road_canon, c.seg, c.along, c.cond"
+                 " FROM report_log rl JOIN conditions c ON c.id = rl.cond_id"
+                 " WHERE rl.server=?")
+            args = [server]
+            if since is not None:
+                q += " AND rl.created_at >= ?"
+                args.append(since)
+            q += " ORDER BY rl.created_at DESC LIMIT ?"
+            args.append(limit)
+            rows = self.db.execute(q, args).fetchall()
+        canon2idx = net["_canon2idx"]
+        out = []
+        for (log_id, tier, discord_id, token_id, mc_uid, counts, created_at,
+             canon, seg, along, cond) in rows:
+            road_idx = canon2idx.get(canon)
+            x = z = None
+            if road_idx is not None and seg < len(net["roads"][road_idx]["segments"]):
+                x, z = rederive(net, road_idx, seg, along, self.bucket)
+            out.append({
+                "id": log_id, "tier": tier, "discordId": discord_id, "tokenId": token_id,
+                "mcUid": mc_uid, "countsTowardCorroboration": bool(counts),
+                "createdAt": int(created_at), "road": road_idx, "seg": seg, "along": along, "cond": cond,
+                "x": None if x is None else round(x, 1), "z": None if z is None else round(z, 1),
+            })
+        return out
+
+    def list_report_log_public(self, server, since=None, limit=200):
+        """Tier B report events ONLY (never A/M -- a fleet holder's own label
+        isn't meant for public display; never C -- no identity to show anyway),
+        for the public website. Gated by BOTH the tier-based reveal delay and
+        PUBLIC_EXTRA_DELAY_RANGE, and only for a condition that has actually
+        published -- the exact same rules query(public=True) applies, checked
+        the same way (one _view_by_id call per distinct condition, cached,
+        since several report_log rows commonly share one cond_id).
+
+        NEVER reads discord_id or mc_uid off report_log at all, let alone
+        returns them -- this is the public map, and nobody (not even an admin
+        viewing this specific feed) should be able to link two report events
+        into "the same traveler" here, which either field would allow (mc_uid
+        especially -- reusing it across entries is exactly how you'd
+        reconstruct someone's route and direction of travel). An admin who
+        genuinely needs to see who reported what already has the real,
+        access-controlled /reports/<server> for that -- this endpoint is not
+        that tool, on purpose."""
+        net = self.networks.get(server)
+        if net is None:
+            raise KeyError(server)
+        now = self.clock()
+        with self._lock:
+            q = ("SELECT rl.id, rl.created_at, rl.cond_id"
+                 " FROM report_log rl WHERE rl.server=? AND rl.tier='B'")
+            args = [server]
+            if since is not None:
+                q += " AND rl.created_at >= ?"
+                args.append(since)
+            q += " ORDER BY rl.created_at DESC"
+            rows = self.db.execute(q, args).fetchall()
+        view_cache = {}
+        out = []
+        for log_id, created_at, cond_id in rows:
+            if cond_id not in view_cache:
+                view_cache[cond_id] = self._view_by_id(net, cond_id, now)
+            v = view_cache[cond_id]
+            if not (v["published"] and v["visiblePublic"]):
+                continue
+            out.append({
+                "id": log_id, "tier": "B",
+                "createdAt": int(created_at), "road": v["road"], "seg": v["seg"],
+                "along": v["along"], "cond": v["cond"], "x": v["x"], "z": v["z"],
+            })
+            if len(out) >= limit:
+                break
+        return out
 
     # ---- leaderboards (SS6.7): Survey (confirmed-report credit) and Road Crew
     # (completed dispatch claims) -- deliberately siloed per server, same as every
@@ -1280,8 +1534,11 @@ _DISPATCH_QUEUE_RE = re.compile(r"^/dispatch/([^/]+)/queue$")
 _DISPATCH_ACTION_RE = re.compile(r"^/dispatch/(\d+)/(claim|complete)$")
 _CREDITS_LEADERBOARD_RE = re.compile(r"^/credits/([^/]+)/leaderboard$")
 _CONDITIONS_ALL_RE = re.compile(r"^/conditions/([^/]+)/all$")
+_REPORTS_LOG_RE = re.compile(r"^/reports/([^/]+)$")
+_REPORTS_LOG_PUBLIC_RE = re.compile(r"^/reports/([^/]+)/public$")
 _REGISTRY_ID_RE = re.compile(r"^/registry/([0-9a-f]{16})$")
 _IDENTITY_ACTION_RE = re.compile(r"^/identity/([^/]+)/([^/]+)/(suspend|reinstate)$")
+_IDENTITY_TIER_RE = re.compile(r"^/identity/([^/]+)/([^/]+)/tier$")
 _IDENTITIES_LIST_RE = re.compile(r"^/identities/([^/]+)$")
 _IDENTITIES_BACKFILL_RE = re.compile(r"^/identities/([^/]+)/names$")
 _ADMIN_GRANT_ID_RE = re.compile(r"^/admin/grants/([0-9a-f]{16})$")
@@ -1392,6 +1649,12 @@ class Handler(BaseHTTPRequestHandler):
         m = _CONDITIONS_ALL_RE.match(path)
         if m:
             return self._conditions_all(m.group(1))
+        m = _REPORTS_LOG_PUBLIC_RE.match(path)
+        if m:
+            return self._reports_log_public(m.group(1))
+        m = _REPORTS_LOG_RE.match(path)
+        if m:
+            return self._reports_log(m.group(1))
         if path == "/registry":
             return self._registry_list()
         if path == "/link/config":
@@ -1438,6 +1701,9 @@ class Handler(BaseHTTPRequestHandler):
         m = _IDENTITIES_BACKFILL_RE.match(path)
         if m:
             return self._identities_backfill_names(m.group(1))
+        m = _IDENTITY_TIER_RE.match(path)
+        if m:
+            return self._identity_set_tier(m.group(1), m.group(2))
         m = _IDENTITY_ACTION_RE.match(path)
         if m:
             return self._identity_action(m.group(1), m.group(2), m.group(3))
@@ -1563,7 +1829,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._json(400, {"error": "bad query param"})
         try:
-            rows = self.app.store.query(server, road_idx=road, frm=frm, to=to)
+            rows = self.app.store.query(server, road_idx=road, frm=frm, to=to, public=True)
         except ValueError as e:
             return self._json(400, {"error": str(e)})
         self._json(200, {"server": server, "conditions": rows})
@@ -2114,6 +2380,64 @@ class Handler(BaseHTTPRequestHandler):
             else self.app.store.repair_leaderboard(server, since=since)
         self._json(200, {"server": server, "kind": kind, "leaderboard": rows})
 
+    def _reports_log(self, server):
+        # Same gate as _credits_leaderboard/_conditions_all -- moderator/admin or
+        # the bot. Genuinely privileged: unlike everything else this feed sits
+        # next to, it names WHO filed each Tier B/A/M report (see ingest()'s
+        # report_log insert), not just an aggregate.
+        scopes = self._caller_scopes(server)
+        is_mod = self.app.auth.is_owner(self._token()) or \
+            trust.SCOPE_MODERATOR in scopes or trust.SCOPE_ADMIN in scopes
+        is_bot = self.app.auth.is_bot(self._token())
+        if not (is_mod or is_bot):
+            return self._json(403, {"error": "the bot credential or moderator/admin scope "
+                                              "is required for this server"})
+        if server not in self.app.store.networks:
+            return self._json(404, {"error": "unknown server"})
+        qs = parse_qs(urlparse(self.path).query)
+        try:
+            since = float(qs["since"][0]) if "since" in qs else None
+            limit = min(int(qs["limit"][0]), 500) if "limit" in qs else 200
+        except ValueError:
+            return self._json(400, {"error": "bad query param"})
+        rows = self.app.store.list_report_log(server, since=since, limit=limit)
+        # Enrich discordId -> discordUsername and tokenId -> holderLabel for
+        # display -- the same identity/registry data the roster and registry
+        # panels already show, just looked up here rather than re-derived.
+        names = {}
+        if self.app.auth.links is not None:
+            names = {i["discordId"]: i["discordUsername"]
+                     for i in self.app.auth.links.list_identities(server)}
+        holder_labels = {t["tokenId"]: t["holderLabel"] for t in self.app.auth.registry.list_active(server)}
+        for row in rows:
+            if row["discordId"] is not None:
+                row["discordUsername"] = names.get(row["discordId"])
+            if row["tokenId"] is not None:
+                row["holderLabel"] = holder_labels.get(row["tokenId"])
+        self._json(200, {"reports": rows})
+
+    def _reports_log_public(self, server):
+        # Public, rate-limited like every other public read (PROTOCOL.md SS7) --
+        # no credential required. ALWAYS anonymous, for EVERY caller, admin
+        # included -- list_report_log_public() never even reads discord_id/
+        # mc_uid off report_log in the first place, so there's nothing here to
+        # accidentally leak. Nobody should be able to use the public map to
+        # correlate report events into "the same traveler" and infer who was
+        # where, in what direction. An admin who genuinely needs per-report
+        # identity has the real, access-controlled /reports/<server> for that.
+        if not self._rate_limit_read():
+            return
+        if server not in self.app.store.networks:
+            return self._json(404, {"error": "unknown server"})
+        qs = parse_qs(urlparse(self.path).query)
+        try:
+            since = float(qs["since"][0]) if "since" in qs else None
+            limit = min(int(qs["limit"][0]), 500) if "limit" in qs else 200
+        except ValueError:
+            return self._json(400, {"error": "bad query param"})
+        rows = self.app.store.list_report_log_public(server, since=since, limit=limit)
+        self._json(200, {"reports": rows})
+
     def _identities_list(self, server):
         # Moderator/admin (same gate as the suspend/reinstate actions this feeds),
         # OR the bot -- it needs to read this roster itself to know which
@@ -2127,7 +2451,69 @@ class Handler(BaseHTTPRequestHandler):
                                               "is required for this server"})
         if self.app.auth.links is None:
             return self._json(503, {"error": "account linking not configured"})
-        self._json(200, {"identities": self.app.auth.links.list_identities(server)})
+        identities = self.app.auth.links.list_identities(server)
+        for row in identities:
+            self._annotate_tier(row, server)
+        self._json(200, {"identities": identities})
+
+    def _annotate_tier(self, row, server):
+        # A linked identity's REPORTING tier is not just its link status --
+        # Tier A/M is a wholly separate bearer-token credential (PROTOCOL.md
+        # SS6.1/6.3), deliberately decoupled from Tier B linking, that an admin
+        # can tie to a specific discord_id (see trust.py's tokens_for_discord).
+        # An identity holding one of those outranks its own link/suspend state.
+        tokens = self.app.auth.registry.tokens_for_discord(row["discordId"], server)
+        full = next((t for t in tokens if t["scope"] == trust.SCOPE_FULL), None)
+        maintainer = next((t for t in tokens if t["scope"] == trust.SCOPE_MAINTAINER), None)
+        if full:
+            row["tier"], row["tierTokenId"] = "A", full["tokenId"]
+        elif maintainer:
+            row["tier"], row["tierTokenId"] = "M", maintainer["tokenId"]
+        else:
+            row["tier"], row["tierTokenId"] = ("C" if row["suspended"] else "B"), None
+
+    def _identity_set_tier(self, server, discord_id):
+        # Admin-only -- vouching for someone at Tier A/M, same authorization
+        # weight as issuing/revoking a registry token directly (_registry_issue/
+        # _registry_revoke), which this ultimately does on the admin's behalf.
+        if not self._require_admin_for(server):
+            return
+        if self.app.auth.links is None:
+            return self._json(503, {"error": "account linking not configured"})
+        try:
+            raw = self._read_body()
+            body = json.loads(raw) if raw else {}
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "bad json"})
+        tier = body.get("tier")
+        if tier not in ("A", "M", "B", "C"):
+            return self._json(400, {"error": "tier must be one of A, M, B, C"})
+
+        # An identity only ever holds one tier's worth of registry standing at a
+        # time -- clear any previous Tier A/M token before granting the new one
+        # (a no-op if it didn't have one) so setting tier doesn't just ADD to
+        # whatever standing already existed.
+        revoked = self.app.auth.registry.revoke_all_for_discord(discord_id, server)
+        result = {"tier": tier, "revokedTokens": revoked}
+        actor = "owner" if self.app.auth.is_owner(self._token()) else f"admin:{self._session_discord_id()}"
+
+        if tier in ("A", "M"):
+            # Tier A/M bypasses corroboration regardless of link/suspension
+            # state, but leaving a stale suspension on the books would be
+            # confusing (and would still block their OWN Tier B token if they
+            # ever lose the A/M one) -- clear it so "Tier A" reads unambiguously.
+            self.app.auth.links.reinstate(discord_id, server)
+            scope = trust.SCOPE_FULL if tier == "A" else trust.SCOPE_MAINTAINER
+            token_id, token = self.app.auth.registry.issue(
+                f"discord:{discord_id}", actor, scope, server, discord_id=discord_id)
+            result["tokenId"] = token_id
+            result["token"] = token
+            result["note"] = "store this now -- it is never shown again"
+        elif tier == "B":
+            self.app.auth.links.reinstate(discord_id, server)
+        else:  # C
+            self.app.auth.links.suspend(discord_id, server)
+        self._json(200, result)
 
     def _identities_backfill_names(self, server):
         # Bot-only: it's the only holder of a real Discord bot token, so it's the

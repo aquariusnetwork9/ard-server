@@ -16,8 +16,17 @@ import trust  # noqa: E402
 GEO_DIR = ROOT / "geometry"
 
 
+class _ZeroRand:
+    """Deterministic stand-in for Store's rand= -- every reveal-delay draw
+    comes out 0, so these tests (unrelated to the reveal-delay feature) keep
+    seeing conditions the instant they're ingested. See test_reveal_delay.py
+    for the feature's own dedicated tests."""
+    def uniform(self, lo, hi):
+        return 0.0
+
+
 def _app(trusted_proxies=None):
-    store = Store(str(GEO_DIR), k_anon=2, ttl=1000, salt="testsalt-clientip")
+    store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, salt="testsalt-clientip")
     auth = Auth(trust.Registry())
     return App(store, auth, trusted_proxies=trusted_proxies)
 

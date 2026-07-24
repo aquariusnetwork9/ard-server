@@ -81,7 +81,8 @@ const TRIGGER_LABEL: Record<DispatchEntry['trigger'], string> = {
 
 async function describeTarget(server: string, entry: DispatchEntry): Promise<string> {
   const road = await roadName(server, entry.road);
-  return `${server} -- **${road}**, segment ${entry.seg}`;
+  const coords = entry.x !== null && entry.z !== null ? ` (${Math.round(entry.x)}, ${Math.round(entry.z)})` : '';
+  return `${server} -- **${road}**, segment ${entry.seg}${coords}`;
 }
 
 function openEmbed(server: string, entry: DispatchEntry, target: string): EmbedBuilder {

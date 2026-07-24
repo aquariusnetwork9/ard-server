@@ -81,15 +81,22 @@ function isHazard(cond: string): boolean {
   return cond !== 'CLEAR' && cond !== 'PRESENCE';
 }
 
+/** "(x, z)" when the server supplied re-derived coordinates, empty otherwise --
+ *  without this, "seg 3" tells nobody where to actually go. */
+function coordsSuffix(c: { x: number | null; z: number | null }): string {
+  return c.x !== null && c.z !== null ? ` (${Math.round(c.x)}, ${Math.round(c.z)})` : '';
+}
+
 async function describeCondition(server: string, c: ConditionEntry, dispatched: Set<string>): Promise<string> {
   const spatialKey = `${c.road}:${c.seg}:${c.along}`;
+  const coords = coordsSuffix(c);
   if (dispatched.has(spatialKey)) {
     const road = await roadName(server, c.road);
-    return `${c.cond} @ **${road}** seg ${c.seg} -- → see #${DISPATCH_CHANNEL_NAMES.open.split('・')[1]}`;
+    return `${c.cond} @ **${road}** seg ${c.seg}${coords} -- → see #${DISPATCH_CHANNEL_NAMES.open.split('・')[1]}`;
   }
   const road = await roadName(server, c.road);
   const confirmedTag = c.published ? '' : ` (${c.tier}-tier, ${c.distinctSources} report${c.distinctSources === 1 ? '' : 's'}, unconfirmed)`;
-  return `${c.cond} @ **${road}** seg ${c.seg}${confirmedTag}`;
+  return `${c.cond} @ **${road}** seg ${c.seg}${coords}${confirmedTag}`;
 }
 
 function radarEmbed(server: string, blockages: string[], unconfirmed: string[], activity: string[]): EmbedBuilder {
@@ -152,10 +159,10 @@ export async function pollOnce(client: Client): Promise<void> {
         if (!prevState) {
           const road = await roadName(server, c.road);
           const label = newState === 'confirmed' ? '✅ confirmed on first report' : '🆕 reported';
-          await recordsCh.send(`${label}: **${c.cond}** @ ${server} -- **${road}** seg ${c.seg} (${c.tier}-tier)`).catch(() => {});
+          await recordsCh.send(`${label}: **${c.cond}** @ ${server} -- **${road}** seg ${c.seg}${coordsSuffix(c)} (${c.tier}-tier)`).catch(() => {});
         } else if (prevState === 'reported' && newState === 'confirmed') {
           const road = await roadName(server, c.road);
-          await recordsCh.send(`✅ confirmed: **${c.cond}** @ ${server} -- **${road}** seg ${c.seg}`).catch(() => {});
+          await recordsCh.send(`✅ confirmed: **${c.cond}** @ ${server} -- **${road}** seg ${c.seg}${coordsSuffix(c)}`).catch(() => {});
         }
       }
       serverState.keys[key] = newState;
