@@ -450,7 +450,11 @@ class HttpTests(unittest.TestCase):
         req("POST", self.url("/report"), token=tok2, body=r)
         code, body = req("GET", self.url(f"/conditions/{SERVER}"))
         at_spot = [c for c in body["conditions"] if c["along"] == r["along"] and c["road"] == r["road"]]
-        self.assertEqual(at_spot, [], "same identity via 2 UIDs is still only 1 distinct source")
+        # Same identity via 2 UIDs is still only 1 distinct source -- shows up
+        # unconfirmed (a real Tier B identity reported it) but not published.
+        self.assertEqual(len(at_spot), 1)
+        self.assertEqual(at_spot[0]["distinctSources"], 1)
+        self.assertFalse(at_spot[0]["published"])
 
         # A genuinely different identity IS a second distinct source -> publishes.
         _, i3 = req("POST", self.url("/link/init"), body={"mcUid": "mc-uid-other", "server": SERVER})
@@ -460,6 +464,7 @@ class HttpTests(unittest.TestCase):
         code, body = req("GET", self.url(f"/conditions/{SERVER}"))
         at_spot = [c for c in body["conditions"] if c["along"] == r["along"] and c["road"] == r["road"]]
         self.assertEqual(len(at_spot), 1)
+        self.assertTrue(at_spot[0]["published"])
 
     def test_identity_suspend_requires_moderator(self):
         self.assertEqual(
@@ -668,7 +673,9 @@ class HttpTests(unittest.TestCase):
 
         code, body = req("GET", self.url(f"/conditions/{SERVER}"))
         at_spot = [c for c in body["conditions"] if c["along"] == r["along"] and c["road"] == r["road"]]
-        self.assertEqual(at_spot, [], "losing one of two corroborating sources drops it below k_tier_b")
+        # Still shows (unconfirmed, one real Tier B source left), but no longer published.
+        self.assertEqual(len(at_spot), 1, "losing one of two corroborating sources drops it below k_tier_b")
+        self.assertFalse(at_spot[0]["published"])
 
         req("POST", self.url(f"/identity/{SERVER}/discord-user-retract-test/reinstate"), token=MODERATOR_TOKEN)
 

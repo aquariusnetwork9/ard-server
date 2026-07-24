@@ -211,6 +211,64 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["cond"], "HOLE")
 
+    def test_lone_tier_b_report_shows_unconfirmed_on_the_public_feed(self):
+        # A real (Tier B+) identity's single report is worth SOME public
+        # visibility -- unlike bare-anonymous Tier C, which stays fully
+        # invisible below k_anon (test_query_hides_unpublished above).
+        r = self.report(3100, 0)
+        v = self.store.ingest(r, "discord-lone-1", "B")
+        self.assertFalse(v["published"])
+        rows = self.store.query(SERVER)
+        self.assertEqual(len(rows), 1, "a lone Tier B report still shows, marked unconfirmed")
+        self.assertFalse(rows[0]["published"])
+        self.assertEqual(rows[0]["distinctSources"], 1)
+
+    def test_a_second_tier_c_report_confirms_a_lone_tier_b_report(self):
+        # The corroboration pool isn't tier-siloed -- any tier's weight adds to
+        # the SAME sum, checked against the condition's own (here, B's lower)
+        # threshold. One more report of ANY tier, including anonymous C, is
+        # enough once a real Tier B identity already reported it.
+        r = self.report(3200, 0)
+        self.store.ingest(r, "discord-lone-2", "B")
+        v = self.store.ingest(r, "10.0.0.50", "C")
+        self.assertTrue(v["published"], "a Tier C report can confirm an existing lone Tier B report")
+        rows = self.store.query(SERVER)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["published"])
+
+    def test_confirming_report_instantly_credits_the_opted_in_tier_b_reporter(self):
+        # Without credit_opt_in_check wired, the cross-tier credit path is a
+        # no-op -- confirms it doesn't blow up when the callback is absent
+        # (e.g. a Store built without LinkStore wiring, like most tests here).
+        r = self.report(3300, 0)
+        self.store.ingest(r, "discord-lone-3", "B")
+        v = self.store.ingest(r, "10.0.0.51", "C")
+        self.assertTrue(v["published"])
+
+    def test_confirming_report_credits_via_the_opt_in_callback(self):
+        opted_in = {"discord-credit-lone": True}
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt-crosscredit",
+                      credit_opt_in_check=lambda discord_id, server: opted_in.get(discord_id, False))
+        net = store.networks[SERVER]
+        map_hash = store.map_hashes[SERVER]
+        r = reference_client.build_report(3400, 120, 0, "NETHER", net, map_hash, SERVER,
+                                          cond="HOLE", now=self.clock.t)
+        store.ingest(r, "discord-credit-lone", "B")  # lone, unpublished, no credit yet
+        store.ingest(r, "10.0.0.60", "C")  # confirms it -- Tier C, not the Tier B reporter
+        self.assertEqual(store.award_leaderboard(SERVER), [{"discordId": "discord-credit-lone", "count": 1}],
+                         "the opted-in Tier B reporter is credited immediately, without needing to resend")
+
+    def test_confirming_report_does_not_credit_an_opted_out_reporter(self):
+        store = Store(str(GEO_DIR), rand=_ZeroRand(), k_anon=2, ttl=1000, clock=self.clock, salt="testsalt-crosscredit2",
+                      credit_opt_in_check=lambda discord_id, server: False)
+        net = store.networks[SERVER]
+        map_hash = store.map_hashes[SERVER]
+        r = reference_client.build_report(3500, 120, 0, "NETHER", net, map_hash, SERVER,
+                                          cond="HOLE", now=self.clock.t)
+        store.ingest(r, "discord-not-opted-in", "B")
+        store.ingest(r, "10.0.0.61", "C")
+        self.assertEqual(store.award_leaderboard(SERVER), [])
+
     def test_ttl_expiry(self):
         self.store.ingest(self.report(4000, 0), "10.0.0.1", "A")
         self.assertEqual(len(self.store.query(SERVER)), 1)
@@ -732,7 +790,18 @@ class BroadcastPublishOnlyTests(unittest.TestCase):
         q = self.store.subscribe(SERVER)
         v = self.store.ingest(self.report(4000, 0), "10.0.0.1", "C")  # k_anon=2, tentative
         self.assertFalse(v["published"])
-        self.assertEqual(self.drain(q), [], "a below-threshold report must not reach subscribers")
+        self.assertEqual(self.drain(q), [], "a below-threshold Tier C report must not reach subscribers")
+
+    def test_lone_tier_b_report_is_broadcast_unconfirmed(self):
+        # Unlike Tier C, a lone Tier B report DOES reach subscribers now --
+        # query(public=True) shows it too (marked unconfirmed), so hiding it
+        # from SSE specifically would just make the stream lag the GET feed.
+        q = self.store.subscribe(SERVER)
+        v = self.store.ingest(self.report(4050, 0), "discord-broadcast-1", "B")
+        self.assertFalse(v["published"])
+        events = self.drain(q)
+        self.assertEqual(len(events), 1)
+        self.assertFalse(events[0]["published"])
 
     def test_publish_transition_is_broadcast(self):
         q = self.store.subscribe(SERVER)

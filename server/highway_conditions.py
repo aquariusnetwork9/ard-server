@@ -231,8 +231,17 @@ class Store:
                  k_anon=4, k_tier_b=2, ttl=3600, clear_factor=2, reopen_window=3600,
                  salt=None, clock=time.time, max_travel_speed=MAX_TRAVEL_SPEED_DEFAULT,
                  on_event=None, presence_oracles=None, identity_salt=None,
-                 dispatch_ttl=86400, dispatch_claim_timeout=7200, rand=None):
+                 dispatch_ttl=86400, dispatch_claim_timeout=7200, rand=None,
+                 credit_opt_in_check=None):
         self.bucket = bucket
+        # Optional (discord_id, server) -> bool -- lets ingest() immediately
+        # credit an EARLIER opted-in Tier B reporter the moment a differently-
+        # tiered report corroborates their previously-lone, unpublished report,
+        # instead of waiting for that reporter's own next resend. Deliberately
+        # a callback, not a hard dependency on identity.LinkStore -- Store stays
+        # decoupled from identity.py the same way it already is for the
+        # per-caller credit_id path (see ingest()'s own docstring on that).
+        self.credit_opt_in_check = credit_opt_in_check
         # Draws the reveal-delay jitter (REVEAL_DELAY_RANGE) -- injectable so
         # tests get deterministic offsets the same way clock is injectable.
         self.rand = rand or random.Random()
@@ -753,6 +762,25 @@ class Store:
                     " VALUES(?,?,?,'report',?)",
                     (server, cond_id, credit_id, now))
                 self.db.commit()
+            # Cross-tier confirmation credit: a lone Tier B report earns its
+            # opted-in reporter Survey credit the INSTANT some other report
+            # (Tier C and above -- another B, or a fleet A/M) corroborates it,
+            # rather than only on that Tier B reporter's own next resend (the
+            # general case just above). Only fires when THIS report itself
+            # isn't the one being credited (tier == "B" already went through
+            # the credit_id path above) and only for identities not already
+            # credited (INSERT OR IGNORE, same UNIQUE(cond_id,discord_id,kind)).
+            if tier != "B" and view["published"] and self.credit_opt_in_check is not None:
+                b_reporters = self.db.execute(
+                    "SELECT DISTINCT discord_id FROM report_log"
+                    " WHERE cond_id=? AND tier='B' AND discord_id IS NOT NULL", (cond_id,)).fetchall()
+                for (b_discord_id,) in b_reporters:
+                    if self.credit_opt_in_check(b_discord_id, server):
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO credits(server, cond_id, discord_id, kind, awarded_at)"
+                            " VALUES(?,?,?,'report',?)",
+                            (server, cond_id, b_discord_id, now))
+                self.db.commit()
         if reopened:
             self.add_moderation(report, kind="reopen")
             self._emit("reopen", {"server": server, "road": report["road"],
@@ -770,15 +798,19 @@ class Store:
         # all -- see _conditions_stream), so it gates on visiblePublic, the same
         # full delay (tier-based + PUBLIC_EXTRA_DELAY_RANGE) query(public=True)
         # applies -- not the shorter "visible" the mod/bot-only /all feed uses.
-        if view["published"] and view.pop("visiblePublic"):
-            # Only ever stream published AND revealed views. An unpublished
-            # (tentative, below-threshold) view still carries distinctSources/
-            # confidence/cond/road/seg/along -- broadcasting it regardless of
-            # publish state would hand any SSE subscriber a live readout of
-            # exactly how close a given spot is to crossing the corroboration
-            # threshold, and exactly when a specific report landed, neither of
-            # which /conditions itself ever exposes (query() only ever returns
-            # published rows by default).
+        # show_publicly mirrors query()'s own floor exactly: a fully published
+        # view, OR a lone (below-threshold) Tier B/A/M report -- pure Tier C
+        # stays hidden either way, same reasoning query() documents (it can
+        # already fully corroborate a Tier B report anyway, no separate gate
+        # needed here for that case).
+        show_publicly = view["published"] or (view["tier"] != "C" and view["distinctSources"] >= 1)
+        if show_publicly and view.pop("visiblePublic"):
+            # Only ever stream a state query(public=True) would itself return --
+            # a pure Tier C tentative view still carries distinctSources/
+            # confidence/cond/road/seg/along -- broadcasting it regardless would
+            # hand any SSE subscriber a live readout of exactly how close a
+            # given spot is to crossing ITS OWN (still-hidden) corroboration
+            # threshold, which /conditions never exposes for Tier C either.
             self._broadcast(server, view)
         view.pop("visible", None)
         view.pop("visiblePublic", None)
@@ -883,8 +915,19 @@ class Store:
                 continue
             if to is not None and v["along"] > to:
                 continue
-            if not include_unpublished and not v["published"]:
-                continue
+            if not v["published"]:
+                # A lone (below-threshold) Tier B/A/M report still shows, marked
+                # unconfirmed via its own `published: false` -- a real linked (or
+                # registry-vetted) identity's single report is worth SOME public
+                # visibility, unlike a bare anonymous Tier C claim, which stays
+                # fully invisible until it crosses k_anon on its own. One more
+                # report of ANY tier (including a second Tier C) adds its weight
+                # to the very same pool and can cross the (lower) k_tier_b
+                # threshold from here -- see ingest()'s corroboration-weight
+                # note; nothing extra needed to "confirm" it.
+                show_unconfirmed = v["tier"] != "C" and v["distinctSources"] >= 1
+                if not (include_unpublished or show_unconfirmed):
+                    continue
             if v["cond"] in _HAZARD_CONDS:
                 clear_ts = self._active_clear(server, canon, v["seg"], v["along"], now)
                 # Compare against the row's raw timestamp, not the view's int-rounded
@@ -2833,12 +2876,21 @@ def _resolve_identity_salt(args):
 
 def build_app(args):
     presence_oracles = _default_presence_oracles(args)
+    # Constructed before Store so its bound credit_opt_in_for can be handed
+    # straight to Store's credit_opt_in_check -- the cross-tier confirmation
+    # credit path (ingest()) needs it to award an opted-in Tier B reporter the
+    # instant some OTHER tier's report corroborates them.
+    links = identity.LinkStore(db_path=args.identity_db, link_code_ttl=args.link_code_ttl,
+                                max_linked_uids=args.max_linked_uids,
+                                min_discord_age=getattr(args, "min_discord_age_days", 0) * 86400,
+                                require_ownership_proof=getattr(args, "require_ownership_proof", True))
     store = Store(args.geometry, db_path=args.db, bucket=args.bucket,
                   k_anon=args.k_anon, k_tier_b=args.k_tier_b, ttl=args.ttl,
                   clear_factor=args.clear_factor, reopen_window=args.reopen_window,
                   max_travel_speed=args.max_travel_speed, presence_oracles=presence_oracles,
                   identity_salt=_resolve_identity_salt(args),
-                  dispatch_ttl=args.dispatch_ttl, dispatch_claim_timeout=args.dispatch_claim_timeout)
+                  dispatch_ttl=args.dispatch_ttl, dispatch_claim_timeout=args.dispatch_claim_timeout,
+                  credit_opt_in_check=links.credit_opt_in_for)
     notifier = notify.Notifier(url=getattr(args, "ntfy_url", None),
                                 token=getattr(args, "ntfy_token", None))
     if notifier.enabled:
@@ -2846,10 +2898,6 @@ def build_app(args):
     registry = trust.Registry(db_path=args.registry_db)
     _seed_registry(registry, args.seed_token)
     _seed_discord_admins(registry, args.discord_admin)
-    links = identity.LinkStore(db_path=args.identity_db, link_code_ttl=args.link_code_ttl,
-                                max_linked_uids=args.max_linked_uids,
-                                min_discord_age=getattr(args, "min_discord_age_days", 0) * 86400,
-                                require_ownership_proof=getattr(args, "require_ownership_proof", True))
     session_store = sessions_mod.SessionStore(db_path=args.session_db, session_ttl=args.session_ttl)
     cfg = {}
     if args.tokens_file and Path(args.tokens_file).exists():

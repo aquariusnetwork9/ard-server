@@ -138,6 +138,7 @@ html, body {
 }
 
 .hz-popup b { color: var(--acc); }
+.unconfirmed-tag { color: var(--txt-dim); font-style: italic; font-weight: normal; }
 
 /* link.html (account linking) */
 .hidden { display: none !important; }

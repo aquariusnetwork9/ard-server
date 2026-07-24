@@ -128,6 +128,11 @@
       row.innerHTML = '<span class="legend-swatch" style="background:' + s.color + '"></span>' + s.label;
       legendItems.appendChild(row);
     });
+    var note = document.createElement("div");
+    note.className = "legend-row dim-note";
+    note.style.marginTop = "4px";
+    note.textContent = "faint/dashed = unconfirmed (one more report confirms it)";
+    legendItems.appendChild(note);
   }
 
   function setConn(state, text) {
@@ -152,10 +157,14 @@
   function popupHTML(v) {
     var s = COND_STYLE[v.cond] || DEFAULT_STYLE;
     var lines = [
-      "<b>" + s.label + "</b> (tier " + v.tier + ")",
+      "<b>" + s.label + "</b> (tier " + v.tier + ")"
+        + (v.published ? "" : " — <span class=\"unconfirmed-tag\">unconfirmed</span>"),
       "reports: " + v.reports + " · distinct sources: " + v.distinctSources,
       "confidence: " + v.confidence,
     ];
+    if (!v.published) {
+      lines.push("one more report (any tier) would confirm this");
+    }
     if (v.laneMin !== null && v.laneMin !== undefined) {
       lines.push("lane span: " + v.laneMin + " .. " + v.laneMax);
     }
@@ -253,9 +262,13 @@
       // NOTE: `sev` is validated on ingest but Store doesn't persist/aggregate it
       // yet (no column on `conditions`), so there's no real severity signal to
       // size markers by here -- constant radius until that's added server-side.
+      // Unconfirmed (published: false) markers now reach the public feed too --
+      // a lone Tier B+ report is worth SOME visibility, just visually distinct
+      // (hollow/dashed) from a fully corroborated one.
       L.circleMarker(w2ll(v.x, v.z), {
         radius: 7, color: s.color, weight: 2,
-        fillColor: s.color, fillOpacity: 0.55,
+        fillColor: s.color, fillOpacity: v.published ? 0.55 : 0.12,
+        dashArray: v.published ? null : "4,3",
       }).bindPopup(popupHTML(v)).addTo(hazardLayer);
     });
   }
