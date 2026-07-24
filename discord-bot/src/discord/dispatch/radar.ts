@@ -99,19 +99,48 @@ async function describeCondition(server: string, c: ConditionEntry, dispatched: 
   return `${c.cond} @ **${road}** seg ${c.seg}${coords}${confirmedTag}`;
 }
 
+// Discord hard-caps an embed field's value at 1024 chars. Capping by line
+// COUNT alone (the old `slice(0, 12)`) isn't enough once individual lines
+// get long (coords + tier + report-count suffixes) -- a flood of reports on
+// one road can still blow the count-capped list past 1024 and crash
+// addFields, taking down the whole poll. Cap by character budget instead,
+// always leaving room for a trailing "+N more" line when truncated.
+const FIELD_CHAR_BUDGET = 1000;
+
+function joinCapped(lines: string[], maxLines: number): string {
+  if (!lines.length) return 'none';
+  const shown: string[] = [];
+  let used = 0;
+  let i = 0;
+  for (; i < lines.length && i < maxLines; i++) {
+    const withNewline = lines[i].length + (shown.length ? 1 : 0);
+    if (used + withNewline > FIELD_CHAR_BUDGET) break;
+    shown.push(lines[i]);
+    used += withNewline;
+  }
+  const omitted = lines.length - shown.length;
+  if (omitted > 0) {
+    const more = `*+${omitted} more not shown*`;
+    // Make room for the "+N more" line itself if we're right at the edge.
+    while (shown.length && used + 1 + more.length > FIELD_CHAR_BUDGET) {
+      used -= shown[shown.length - 1].length + (shown.length > 1 ? 1 : 0);
+      shown.pop();
+    }
+    shown.push(more);
+  }
+  return shown.join('\n');
+}
+
 function radarEmbed(server: string, blockages: string[], unconfirmed: string[], activity: string[]): EmbedBuilder {
   const embed = new EmbedBuilder()
     .setTitle(`${server} -- road radar`)
     .setColor(blockages.length > 0 ? 0xe74c3c : unconfirmed.length > 0 ? 0xf1c40f : 0x2ecc71)
     .setFooter({ text: `updated ${new Date().toLocaleTimeString()}` });
   embed.addFields(
-    { name: `🔴 Blockages (${blockages.length})`, value: blockages.length ? blockages.slice(0, 12).join('\n') : 'none' },
-    { name: `🟡 Unconfirmed (${unconfirmed.length})`, value: unconfirmed.length ? unconfirmed.slice(0, 12).join('\n') : 'none' },
-    { name: `👤 Activity (${activity.length})`, value: activity.length ? activity.slice(0, 8).join('\n') : 'none' },
+    { name: `🔴 Blockages (${blockages.length})`, value: joinCapped(blockages, 12) },
+    { name: `🟡 Unconfirmed (${unconfirmed.length})`, value: joinCapped(unconfirmed, 12) },
+    { name: `👤 Activity (${activity.length})`, value: joinCapped(activity, 8) },
   );
-  if (blockages.length > 12 || unconfirmed.length > 12 || activity.length > 8) {
-    embed.setDescription('(list truncated to the busiest entries per section)');
-  }
   return embed;
 }
 
