@@ -169,3 +169,13 @@ class HazardEpisodesTests(unittest.TestCase):
         self.assertEqual(episodes[0]["distinctSources"], 2)
         self.assertIn("confidence", episodes[0])
         self.assertIn("published", episodes[0])
+
+    def test_episode_carries_x_z_for_compass_labeling(self):
+        # road/seg alone can't tell an "axis" road's two arms apart (they
+        # share one segment spanning both directions through spawn) -- x/z is
+        # what a caller needs to derive a real compass direction.
+        r = self.report(4500, 0)
+        self.store.ingest(r, "discord-xz", "B")
+        episodes = self.store.list_hazard_episodes(SERVER)
+        self.assertIsInstance(episodes[0]["x"], float)
+        self.assertIsInstance(episodes[0]["z"], float)

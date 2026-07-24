@@ -1292,6 +1292,7 @@ class Store:
                     view.pop("visiblePublic", None)
                     episodes[cond_id] = {
                         "condId": cond_id, "road": view["road"], "seg": view["seg"], "along": view["along"],
+                        "x": view["x"], "z": view["z"],
                         "cond": view["cond"], "tier": view["tier"], "published": view["published"],
                         "distinctSources": view["distinctSources"], "confidence": view["confidence"],
                         "firstSeen": view["firstSeen"], "lastSeen": view["lastSeen"], "events": [],

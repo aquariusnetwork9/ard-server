@@ -91,10 +91,10 @@ async function describeCondition(server: string, c: ConditionEntry, dispatched: 
   const spatialKey = `${c.road}:${c.seg}:${c.along}`;
   const coords = coordsSuffix(c);
   if (dispatched.has(spatialKey)) {
-    const road = await roadName(server, c.road);
+    const road = await roadName(server, c.road, c.x, c.z);
     return `${c.cond} @ **${road}** seg ${c.seg}${coords} -- → see #${DISPATCH_CHANNEL_NAMES.open.split('・')[1]}`;
   }
-  const road = await roadName(server, c.road);
+  const road = await roadName(server, c.road, c.x, c.z);
   const confirmedTag = c.published ? '' : ` (${c.tier}-tier, ${c.distinctSources} report${c.distinctSources === 1 ? '' : 's'}, unconfirmed)`;
   return `${c.cond} @ **${road}** seg ${c.seg}${coords}${confirmedTag}`;
 }
@@ -186,11 +186,11 @@ export async function pollOnce(client: Client): Promise<void> {
       const prevState = serverState.keys[key];
       if (recordsCh) {
         if (!prevState) {
-          const road = await roadName(server, c.road);
+          const road = await roadName(server, c.road, c.x, c.z);
           const label = newState === 'confirmed' ? '✅ confirmed on first report' : '🆕 reported';
           await recordsCh.send(`${label}: **${c.cond}** @ ${server} -- **${road}** seg ${c.seg}${coordsSuffix(c)} (${c.tier}-tier)`).catch(() => {});
         } else if (prevState === 'reported' && newState === 'confirmed') {
-          const road = await roadName(server, c.road);
+          const road = await roadName(server, c.road, c.x, c.z);
           await recordsCh.send(`✅ confirmed: **${c.cond}** @ ${server} -- **${road}** seg ${c.seg}${coordsSuffix(c)}`).catch(() => {});
         }
       }

@@ -153,6 +153,48 @@
     if (isAdmin) { loadRegistry(server); loadGrants(server); }
   }
 
+  // ---- road naming (shared by the reports/episodes panels below) ----
+  // /geometry/<server> is fully public (PROTOCOL.md SS7) -- fetched here
+  // purely to turn a bare road index into its real name instead of "road 3".
+  var geometryCache = null; // {server, roads: [{i, name, category}]}
+
+  function loadGeometry(server) {
+    if (geometryCache && geometryCache.server === server) return Promise.resolve(geometryCache);
+    return api("/geometry/" + encodeURIComponent(server)).then(function (res) {
+      geometryCache = {
+        server: server,
+        roads: res.ok ? (res.body.roads || []) : [],
+      };
+      return geometryCache;
+    });
+  }
+
+  // Mirrors website/app.js's own compassLabel() and ard-client.ts's port of
+  // it exactly (x = east(+)/west(-), z = south(+)/north(-)) -- kept in sync
+  // by hand across all three runtimes, no shared module between them.
+  function compassLabel(x, z) {
+    var ns = z < 0 ? "N" : z > 0 ? "S" : "";
+    var ew = x > 0 ? "E" : x < 0 ? "W" : "";
+    return ns + ew;
+  }
+
+  // The "axis" category folds all 8 cardinal/diagonal rays into just 4
+  // segments (each spanning BOTH directions through spawn -- see
+  // geometry.py's own module note), so its name alone ("Highway Axis (dug)")
+  // can't tell a report on the NE arm from one on the SW arm of the same
+  // segment. x/z (already returned alongside road/seg by both the flat log
+  // and the episodes endpoint) is what resolves that ambiguity.
+  function roadLabel(roadIdx, x, z) {
+    if (roadIdx === null || roadIdx === undefined) return "road #?";
+    var road = geometryCache && geometryCache.roads.filter(function (r) { return r.i === roadIdx; })[0];
+    if (!road) return "road #" + roadIdx;
+    if (road.category === "axis" && x !== null && x !== undefined && z !== null && z !== undefined) {
+      var compass = compassLabel(x, z);
+      return compass ? compass + " " + road.name : road.name;
+    }
+    return road.name;
+  }
+
   // ---- moderation queue ----
   function itemRow(icon, name, sub, tag) {
     var row = document.createElement("div");
@@ -202,7 +244,9 @@
 
   // ---- per-report audit log (Tier B+ only) ----
   function loadReports(server) {
-    api("/reports/" + encodeURIComponent(server) + "?limit=100").then(function (res) {
+    Promise.all([loadGeometry(server), api("/reports/" + encodeURIComponent(server) + "?limit=100")])
+      .then(function (results) {
+      var res = results[1];
       var el = $("reports-list");
       if (!res.ok) { el.textContent = res.body.error || "couldn't load"; return; }
       var reports = res.body.reports || [];
@@ -214,7 +258,7 @@
         // carries holderLabel (the registry token's own label) -- exactly one
         // of the two is ever set, matching ingest()'s report_log write.
         var who = r.discordId ? (r.discordUsername || r.discordId) : (r.holderLabel || r.tokenId);
-        var where = "road " + r.road + " seg " + r.seg
+        var where = roadLabel(r.road, r.x, r.z) + " seg " + r.seg
           + (r.x !== null && r.z !== null ? " (" + r.x + ", " + r.z + ")" : "");
         var sub = who + " · " + where + " · " + fmtDate(r.createdAt)
           + (r.countsTowardCorroboration ? "" : " · didn't count (non-overlap/travel check)");
@@ -229,14 +273,17 @@
   // for why that's already the right dedup key (a resend never creates a new
   // conditions row, it updates the same one).
   function loadReportEpisodes(server) {
-    api("/reports/" + encodeURIComponent(server) + "/episodes?limit=100").then(function (res) {
+    Promise.all([loadGeometry(server), api("/reports/" + encodeURIComponent(server) + "/episodes?limit=100")])
+      .then(function (results) {
+      var res = results[1];
       var el = $("reports-episodes-list");
       if (!res.ok) { el.textContent = res.body.error || "couldn't load"; return; }
       var episodes = res.body.episodes || [];
       el.innerHTML = "";
       if (!episodes.length) { el.innerHTML = "<div class=\"a-empty\">No Tier B+ reports logged yet on this server.</div>"; return; }
       episodes.forEach(function (ep) {
-        var where = "road " + ep.road + " seg " + ep.seg + " along " + ep.along;
+        var where = roadLabel(ep.road, ep.x, ep.z) + " seg " + ep.seg + " along " + ep.along
+          + (ep.x !== null && ep.z !== null ? " (" + ep.x + ", " + ep.z + ")" : "");
         var span = ep.firstSeen === ep.lastSeen ? fmtDate(ep.firstSeen)
           : fmtDate(ep.firstSeen) + " → " + fmtDate(ep.lastSeen);
         var sub = where + " · " + ep.events.length + " report(s), " + ep.distinctSources + " distinct source(s)"

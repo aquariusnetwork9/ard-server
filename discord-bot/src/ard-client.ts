@@ -92,16 +92,36 @@ export async function completeDispatch(id: number, discordId: string): Promise<v
 export interface GeoRoad {
   i: number;
   name: string;
+  category: string;
 }
 
 let geometryCache: { server: string; roads: GeoRoad[]; fetchedAt: number } | null = null;
 const GEOMETRY_CACHE_TTL_MS = 10 * 60 * 1000;
 
+/** e.g. compassLabel(500, -500) -> "NE" -- mirrors website/app.js's own
+ *  compassLabel() exactly (x = east(+)/west(-), z = south(+)/north(-), per
+ *  the geometry file's own axes note), kept in sync by hand since this is
+ *  TS/JS on two separate runtimes with no shared module between them. */
+function compassLabel(x: number, z: number): string {
+  const ns = z < 0 ? 'N' : z > 0 ? 'S' : '';
+  const ew = x > 0 ? 'E' : x < 0 ? 'W' : '';
+  return ns + ew;
+}
+
 /** GET /geometry/<server> -- fully public (PROTOCOL.md SS7), just the road
  *  table, cached for a while since it only ever changes on a geometry
- *  redeploy. Used purely to render a human-readable road name instead of a
- *  bare index in dispatch embeds/log lines. */
-export async function roadName(server: string, roadIdx: number | null): Promise<string> {
+ *  redeploy. Used to render a human-readable road name instead of a bare
+ *  index in dispatch embeds/log lines.
+ *
+ *  The "axis" category is a special case: it folds all 8 cardinal/diagonal
+ *  rays into just 4 segments (each spanning BOTH directions through spawn --
+ *  see geometry.py's own module note), so its name alone ("Highway Axis
+ *  (dug)") can't tell a report on the NE arm from one on the SW arm of the
+ *  same segment -- only the real (x, z) can, which is why x/z are required
+ *  here rather than optional: every actual caller already has them
+ *  (rederived server-side), and a road/seg number with no coordinate context
+ *  is exactly the ambiguity this exists to avoid. */
+export async function roadName(server: string, roadIdx: number | null, x: number | null, z: number | null): Promise<string> {
   if (roadIdx === null) return 'unknown road';
   const now = Date.now();
   if (!geometryCache || geometryCache.server !== server || now - geometryCache.fetchedAt > GEOMETRY_CACHE_TTL_MS) {
@@ -111,11 +131,17 @@ export async function roadName(server: string, roadIdx: number | null): Promise<
     if (!body?.roads) return `road #${roadIdx}`;
     geometryCache = {
       server,
-      roads: body.roads.map((r: any) => ({ i: r.i, name: r.name })),
+      roads: body.roads.map((r: any) => ({ i: r.i, name: r.name, category: r.category })),
       fetchedAt: now,
     };
   }
-  return geometryCache.roads.find(r => r.i === roadIdx)?.name ?? `road #${roadIdx}`;
+  const road = geometryCache.roads.find(r => r.i === roadIdx);
+  if (!road) return `road #${roadIdx}`;
+  if (road.category === 'axis' && x !== null && z !== null) {
+    const compass = compassLabel(x, z);
+    return compass ? `${compass} ${road.name}` : road.name;
+  }
+  return road.name;
 }
 
 export class ArdCreditsError extends Error {}

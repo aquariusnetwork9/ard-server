@@ -80,7 +80,7 @@ const TRIGGER_LABEL: Record<DispatchEntry['trigger'], string> = {
 };
 
 async function describeTarget(server: string, entry: DispatchEntry): Promise<string> {
-  const road = await roadName(server, entry.road);
+  const road = await roadName(server, entry.road, entry.x, entry.z);
   const coords = entry.x !== null && entry.z !== null ? ` (${Math.round(entry.x)}, ${Math.round(entry.z)})` : '';
   return `${server} -- **${road}**, segment ${entry.seg}${coords}`;
 }
