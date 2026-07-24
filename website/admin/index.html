@@ -47,13 +47,8 @@
 
     <div class="a-ws">
       <div class="a-col">
-        <section id="panel-moderation" class="a-panel hidden">
-          <h3>🚧 Moderation queue<span class="sub" id="mod-count"></span></h3>
-          <div id="mod-list" class="a-list"></div>
-        </section>
-
-        <section id="panel-reports" class="a-panel hidden">
-          <h3>📋 Report activity<span class="sub" id="reports-count"></span></h3>
+        <details id="panel-reports" class="a-panel hidden" open>
+          <summary><h3>📋 Report activity<span class="sub" id="reports-count"></span></h3></summary>
           <p class="a-dim" style="margin:0 0 .5rem">Tier B and above only — who reported what, when.
             Anonymous (Tier C) reports carry no identity and never appear here.</p>
           <div class="a-view-toggle">
@@ -66,8 +61,10 @@
             click to expand its full resend history. A hazard's episode sits right
             above the CLEAR episode that resolved it, if any has yet.</p>
           <div id="reports-episodes-list" class="a-list hidden"></div>
-        </section>
+        </details>
+      </div>
 
+      <div class="a-col">
         <section id="panel-identities" class="a-panel hidden">
           <h3>👥 Linked identities<span class="sub" id="identities-count"></span></h3>
           <div id="identities-list" class="a-list"></div>
@@ -81,6 +78,11 @@
             <button id="identity-reinstate-btn" class="btn go">Reinstate</button>
           </div>
           <div id="identity-result" class="a-dim" style="margin:.5rem 0 0"></div>
+        </section>
+
+        <section id="panel-moderation" class="a-panel hidden">
+          <h3>🚧 Moderation queue<span class="sub" id="mod-count"></span></h3>
+          <div id="mod-list" class="a-list"></div>
         </section>
       </div>
 
