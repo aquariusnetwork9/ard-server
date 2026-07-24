@@ -54,7 +54,7 @@ const SERVER_PREFIX: Record<string, string> = {
 // siloed the same way).
 export const SURVEY_TIER_NAMES = ['Survey Tech', 'Surveyor', 'Senior Surveyor', 'Chief Surveyor'];
 export const CREW_TIER_NAMES = ['Crew Member', 'Crew Leader', 'Foreman', 'Superintendent'];
-export const TIER_THRESHOLDS = [10, 20, 50, 100];
+export const TIER_THRESHOLDS = [50, 100, 250, 500];
 
 const SURVEY_TIER_COLORS = [0x74b9ff, 0x2e86de, 0x1b4f9c, 0x0a2a5e]; // light -> dark blue
 const CREW_TIER_COLORS = [0xffb74d, 0xf57c00, 0x9a5b13, 0x5d3a1a];   // light -> dark amber/brown
