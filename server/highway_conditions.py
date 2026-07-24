@@ -388,6 +388,13 @@ class Store:
     def _effective_ttl(self, tier):
         return TIER_TTL_OVERRIDE.get(tier, self.ttl)
 
+    def _widest_ttl(self):
+        """The widest possible ttl across every tier -- used as a SQL-level
+        cutoff so a Tier B row surviving on its own longer window is never
+        excluded before its real tier can be checked; the precise per-tier
+        cutoff is always re-checked afterward via _effective_ttl."""
+        return max([self.ttl] + list(TIER_TTL_OVERRIDE.values()))
+
     def _ensure_column(self, table, column, coldef):
         cols = [r[1] for r in self.db.execute(f"PRAGMA table_info({table})").fetchall()]
         if column not in cols:
@@ -400,22 +407,25 @@ class Store:
         key = f"{self.salt}|{server}|{canon}|{seg}|{along}|{cond}|{source_key or ''}"
         return hashlib.sha256(key.encode()).hexdigest()[:16]
 
-    def _distinct_sources(self, cond_id, now):
+    def _distinct_sources(self, cond_id, now, tier):
         cur = self.db.execute(
             "SELECT COUNT(*) FROM sources WHERE cond_id=? AND seen>=?",
-            (cond_id, now - self.ttl))
+            (cond_id, now - self._effective_ttl(tier)))
         return cur.fetchone()[0]
 
     # ---- CLEAR <-> hazard reconciliation (PROTOCOL.md SS6.4) ----
     def _hazard_rows(self, server, canon, seg, along, now):
         """Non-expired hazard-type rows (not CLEAR/PRESENCE) at this spatial key --
-        the set a CLEAR at the same key is resolving."""
+        the set a CLEAR at the same key is resolving. Fetched against the WIDEST
+        possible ttl, then precisely filtered per row's own tier -- same pattern
+        as query()."""
         placeholders = ",".join("?" * len(_HAZARD_CONDS))
-        return self.db.execute(
+        rows = self.db.execute(
             f"SELECT id, cond, tier, last_seen FROM conditions"
             f" WHERE server=? AND road_canon=? AND seg=? AND along=? AND cond IN ({placeholders})"
             f" AND last_seen>=?",
-            (server, canon, seg, along, *sorted(_HAZARD_CONDS), now - self.ttl)).fetchall()
+            (server, canon, seg, along, *sorted(_HAZARD_CONDS), now - self._widest_ttl())).fetchall()
+        return [r for r in rows if now - r[3] <= self._effective_ttl(r[2])]
 
     def _reported_a_hazard_here(self, server, canon, seg, along, source_key, now):
         """Did this exact source_key (an IP for Tier C, a discord_id for Tier B)
@@ -445,15 +455,21 @@ class Store:
         at least as vetted as a linked identity."""
         return self.k_anon if tier == "C" else self.k_tier_b
 
-    def _corroboration_weight(self, cond_id, now):
+    def _corroboration_weight(self, cond_id, now, tier):
         """Sum of sources.weight for non-expired sources -- what the publish/confidence
         decision actually uses. See _distinct_sources for the separate raw COUNT kept
         for the public-facing 'distinctSources' field (deliberately not the same number
         once reputation weighting has discounted anyone -- distinctSources is meant to
-        stay a plain, honest headcount)."""
+        stay a plain, honest headcount).
+
+        `tier` picks the "still counts" window the same way _effective_ttl does
+        everywhere else -- a Tier B condition's own confirming sources must stay
+        eligible for as long as the condition itself now persists (24h,
+        TIER_TTL_OVERRIDE), not fall out after the ordinary (shorter) ttl and
+        silently flip an already-published Tier B hazard back to unpublished."""
         cur = self.db.execute(
             "SELECT COALESCE(SUM(weight),0) FROM sources WHERE cond_id=? AND seen>=?",
-            (cond_id, now - self.ttl))
+            (cond_id, now - self._effective_ttl(tier)))
         return cur.fetchone()[0]
 
     def _emit(self, kind, details):
@@ -541,13 +557,15 @@ class Store:
         row = self.db.execute(
             "SELECT id, tier, last_seen FROM conditions"
             " WHERE server=? AND road_canon=? AND seg=? AND along=? AND cond='CLEAR' AND last_seen>=?",
-            (server, canon, seg, along, now - self.ttl)).fetchone()
+            (server, canon, seg, along, now - self._widest_ttl())).fetchone()
         if row is None:
             return None
         cond_id, tier, last_seen = row
+        if now - last_seen > self._effective_ttl(tier):
+            return None  # outside even this CLEAR's own (possibly tier-extended) window
         if _auto_publishes(tier, "CLEAR"):
             return last_seen
-        weight = self._corroboration_weight(cond_id, now)
+        weight = self._corroboration_weight(cond_id, now, tier)
         return last_seen if weight >= self._corroboration_threshold(tier) * self.clear_factor else None
 
     def _check_presence(self, server, mc_uid):
@@ -785,8 +803,8 @@ class Store:
         # distinctSources stays a plain headcount for display; the publish/confidence
         # decision uses the reputation-weighted sum instead (equal to the headcount
         # unless a source has been discounted -- see the note above _TIER_RANK).
-        ds = self._distinct_sources(cond_id, now)
-        weight = self._corroboration_weight(cond_id, now)
+        ds = self._distinct_sources(cond_id, now, tier)
+        weight = self._corroboration_weight(cond_id, now, tier)
         published = _auto_publishes(tier, cond) or (weight >= k_req)
         age = now - last_seen
         recency = max(0.0, 1.0 - age / self._effective_ttl(tier))
@@ -832,7 +850,7 @@ class Store:
         # TIER_TTL_OVERRIDE) so a Tier B row surviving on its own longer window
         # isn't excluded before _row_view even sees its real tier; the PRECISE
         # per-tier cutoff is re-checked per row just below, using _effective_ttl.
-        widest_ttl = max([self.ttl] + list(TIER_TTL_OVERRIDE.values()))
+        widest_ttl = self._widest_ttl()
         with self._lock:
             q = ("SELECT id,server,road_canon,seg,along,cond,tier,reports,first_seen,last_seen,"
                  "lane_min,lane_max,visible_at,public_delay_extra FROM conditions"
@@ -1258,7 +1276,7 @@ class Store:
             f"SELECT 1 FROM conditions WHERE server=? AND road_canon=? AND seg=? AND along=?"
             f" AND cond IN ({placeholders}) AND last_seen>=? AND first_seen>=?",
             (server, canon, seg, along, *sorted(_HAZARD_CONDS),
-             now - self.ttl, now - self.reopen_window)).fetchone()
+             now - self._widest_ttl(), now - self.reopen_window)).fetchone()
         return row is not None
 
     def retract_identity(self, server, source_key, now=None):
@@ -1279,7 +1297,7 @@ class Store:
         with self._lock:
             rows = self.db.execute(
                 "SELECT id, road_canon, seg, along, cond FROM conditions WHERE server=? AND last_seen>=?",
-                (server, now - self.ttl)).fetchall()
+                (server, now - self._widest_ttl())).fetchall()
             for cond_id, canon, seg, along, cond in rows:
                 candidate = self._source_hash(server, canon, seg, along, cond, source_key)
                 cur = self.db.execute(

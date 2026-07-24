@@ -232,6 +232,21 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(self.store.query(SERVER, include_unpublished=True), [],
                          "Tier B's own 24h window still eventually expires it")
 
+    def test_published_tier_b_hazard_stays_published_past_the_ordinary_ttl(self):
+        # The actual bug this guards against: raising a condition's own survival
+        # window to 24h is pointless if the corroboration math backing
+        # "published" still expires its confirming sources after the ordinary
+        # (much shorter) ttl -- that would silently flip an already-published
+        # Tier B hazard back to unpublished long before its 24h is up.
+        r = self.report(4300, 0)
+        self.store.ingest(r, "discord-ttl-a", "B")
+        v = self.store.ingest(r, "discord-ttl-b", "B")  # k_tier_b=2 -> published
+        self.assertTrue(v["published"])
+        self.clock.t += 1001  # past the ordinary ttl=1000, nowhere near 24h
+        rows = self.store.query(SERVER)
+        self.assertEqual(len(rows), 1, "must still be published -- its sources haven't actually expired")
+        self.assertEqual(rows[0]["distinctSources"], 2)
+
     def test_road_filter(self):
         self.store.ingest(self.report(5000, 0), "10.0.0.1", "A")   # z=0 axis
         # Query a road index that has no data -> empty; the data road -> present.
