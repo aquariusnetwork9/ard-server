@@ -54,7 +54,8 @@ export async function execute(interaction: ChatInputCommandInteraction): Promise
   // error worth surfacing here.
   const traveler = guild.roles.cache.find(r => r.name === TRAVELER_ROLE);
   if (traveler && member.roles.cache.has(traveler.id)) {
-    await member.roles.remove(traveler).catch(() => {});
+    await member.roles.remove(traveler).catch(err =>
+      console.error(`[link] Failed to strip Traveler from ${interaction.user.id}:`, err));
   }
 
   await interaction.editReply(

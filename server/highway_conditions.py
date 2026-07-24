@@ -628,38 +628,45 @@ class Store:
             if not (-half <= lane_min <= lane_max <= half):
                 raise ValueError("lane span out of range for this road's width")
         now = self.clock()
-        # A hazard reopening shortly after a published clear is flagged for moderator
-        # review rather than silently republished -- a fast reopen is the practical
-        # signal that the clear was wrong, whether by mistake or bad faith.
-        reopened = False
-        if cond in _HAZARD_CONDS:
-            clear_ts = self._active_clear(server, canon, seg, along, now)
-            if clear_ts is not None and (now - clear_ts) <= self.reopen_window:
-                reopened = True
-        # Dispatch (SS6.5): a CLEAR resolving a hazard that only just appeared is
-        # the same shape as `reopened` in the other direction -- fast-clear-over-
-        # a-fresh-trap instead of fast-reopen-after-a-clear. Checked before the
-        # ingest below updates `conditions`, so "fresh" reflects state prior to
-        # this report.
-        fresh_hazard_before = cond == "CLEAR" and self._fresh_hazard_exists(server, canon, seg, along, now)
-        # Non-overlap (SS6.4): a source that raised a hazard here can't also count
-        # toward clearing it. See _reported_a_hazard_here for why this can't be
-        # enforced by comparing stored hashes -- it has to be checked live, per
-        # request, against this specific source_key. Also reused below: a fast
-        # CLEAR is only a `conflict` dispatch signal when it comes from a
-        # DIFFERENT source than the one that raised the hazard -- an inspector's
-        # own find-it/fix-it/clear-it cycle is the trusted case Tier M/A already
-        # exists for, not a fake-clear-over-a-trap.
-        raised_this_hazard_itself = cond == "CLEAR" and self._reported_a_hazard_here(
-            server, canon, seg, along, source_key, now)
-        counts_toward_corroboration = not raised_this_hazard_itself
-        src = self._source_hash(server, canon, seg, along, cond, source_key)
-        # Reputation layer: only meaningful for tiers that actually go through
-        # corroboration counting -- see the module-level note above _TIER_RANK for why
-        # A/M are excluded (registry-vetted, managed through grant revocation instead).
         identity_hash = None
         weight = 1.0
+        # Every db-touching step below (including the read-only lookups that used
+        # to run before this point) shares one sqlite3 connection across request
+        # threads -- without holding _lock for the whole thing, a concurrent
+        # request's write could interleave with one of these reads and corrupt
+        # the shared connection/cursor state (observed live as sporadic
+        # "sqlite3.InterfaceError: bad parameter or other API misuse" under
+        # bursts of concurrent reports). RLock, so nothing here can deadlock.
         with self._lock:
+            # A hazard reopening shortly after a published clear is flagged for moderator
+            # review rather than silently republished -- a fast reopen is the practical
+            # signal that the clear was wrong, whether by mistake or bad faith.
+            reopened = False
+            if cond in _HAZARD_CONDS:
+                clear_ts = self._active_clear(server, canon, seg, along, now)
+                if clear_ts is not None and (now - clear_ts) <= self.reopen_window:
+                    reopened = True
+            # Dispatch (SS6.5): a CLEAR resolving a hazard that only just appeared is
+            # the same shape as `reopened` in the other direction -- fast-clear-over-
+            # a-fresh-trap instead of fast-reopen-after-a-clear. Checked before the
+            # ingest below updates `conditions`, so "fresh" reflects state prior to
+            # this report.
+            fresh_hazard_before = cond == "CLEAR" and self._fresh_hazard_exists(server, canon, seg, along, now)
+            # Non-overlap (SS6.4): a source that raised a hazard here can't also count
+            # toward clearing it. See _reported_a_hazard_here for why this can't be
+            # enforced by comparing stored hashes -- it has to be checked live, per
+            # request, against this specific source_key. Also reused below: a fast
+            # CLEAR is only a `conflict` dispatch signal when it comes from a
+            # DIFFERENT source than the one that raised the hazard -- an inspector's
+            # own find-it/fix-it/clear-it cycle is the trusted case Tier M/A already
+            # exists for, not a fake-clear-over-a-trap.
+            raised_this_hazard_itself = cond == "CLEAR" and self._reported_a_hazard_here(
+                server, canon, seg, along, source_key, now)
+            counts_toward_corroboration = not raised_this_hazard_itself
+            src = self._source_hash(server, canon, seg, along, cond, source_key)
+            # Reputation layer: only meaningful for tiers that actually go through
+            # corroboration counting -- see the module-level note above _TIER_RANK for why
+            # A/M are excluded (registry-vetted, managed through grant revocation instead).
             if tier in _CORROBORATED_TIERS:
                 identity_hash = self._identity_hash(server, source_key)
                 if not self._check_travel_plausible(identity_hash, report["road"], seg, along, cx, cz, now):
