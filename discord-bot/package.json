@@ -1,6 +1,6 @@
 {
   "name": "highway-discord-bot",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "Aquarius Road Department -- Discord community + account-linking + dispatch-queue + radar/leaderboard bot (\"Highway Bot\")",
   "main": "dist/index.js",
   "scripts": {

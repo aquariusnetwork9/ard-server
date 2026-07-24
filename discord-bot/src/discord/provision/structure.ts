@@ -235,9 +235,9 @@ export const CATEGORIES: CategorySpec[] = [
     oldNames: ['2b2t'],
     visibleTo: ['2b2t Highway Worker', '2b2t Highway Supervisor', ...STAFF_ROLES],
     channels: [
-      { name: '🗨️・2b2t-general', oldNames: ['2b2t-general'] },
+      { name: '🗨️・2b2t-general', topic: 'General 2b2t chat.', oldNames: ['2b2t-general'] },
       { name: '🗺️・2b2t-highway-map', topic: 'https://map.aquariusconnect.org -- periodic map updates & screenshots from Highway Command.', oldNames: ['2b2t-highway-map'], readOnly: true, postRoles: ['Director'] },
-      { name: '🆘・2b2t-help', oldNames: ['2b2t-help'] },
+      { name: '🆘・2b2t-help', topic: 'Ask for help with anything 2b2t-related.', oldNames: ['2b2t-help'] },
       { name: '📰・2b2t-press-releases', topic: 'Official dispatches from Highway Command -- 2b2t-specific news, incl. the rewards program.', readOnly: true, postRoles: ['Director'] },
     ],
   },
@@ -246,9 +246,9 @@ export const CATEGORIES: CategorySpec[] = [
     oldNames: ['6b6t'],
     visibleTo: ['6b6t Highway Worker', '6b6t Highway Supervisor', ...STAFF_ROLES],
     channels: [
-      { name: '🗨️・6b6t-general', oldNames: ['6b6t-general'] },
+      { name: '🗨️・6b6t-general', topic: 'General 6b6t chat.', oldNames: ['6b6t-general'] },
       { name: '🗺️・6b6t-highway-map', topic: 'https://map.aquariusconnect.org -- periodic map updates & screenshots from Highway Command.', oldNames: ['6b6t-highway-map'], readOnly: true, postRoles: ['Director'] },
-      { name: '🆘・6b6t-help', oldNames: ['6b6t-help'] },
+      { name: '🆘・6b6t-help', topic: 'Ask for help with anything 6b6t-related.', oldNames: ['6b6t-help'] },
       { name: '📰・6b6t-press-releases', topic: 'Official dispatches from Highway Command -- 6b6t-specific news, incl. the rewards program.', readOnly: true, postRoles: ['Director'], oldNames: ['📰・press-releases'] },
     ],
   },

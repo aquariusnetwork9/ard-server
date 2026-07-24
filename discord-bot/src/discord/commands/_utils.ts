@@ -131,7 +131,7 @@ export function buildComposedOverwrites(
   }));
 }
 
-export type Outcome = 'created' | 'renamed' | 'existing';
+export type Outcome = 'created' | 'renamed' | 'existing' | 'updated';
 
 /**
  * Finds a role by exact name; failing that, by any name in `oldNames` (an
@@ -207,11 +207,16 @@ export async function findOrCreateTextChannel(
     (c): c is TextChannel | NewsChannel => TEXT_LIKE_TYPES.includes(c.type) && c.name === name
   );
   if (existing) {
+    // topic is compared against '' too -- Discord reports a channel with no
+    // topic as null/'', while an unset ChannelSpec.topic is undefined; only
+    // treat it as a real change when the spec actually declares one.
+    const topicChanged = topic !== undefined && (existing.topic ?? '') !== topic;
     if (!dryRun) {
       if (existing.parentId !== parentId) await existing.setParent(parentId, { lockPermissions: false });
       if (overwrites) await existing.permissionOverwrites.set(overwrites);
+      if (topicChanged) await existing.setTopic(topic);
     }
-    return { channel: existing, outcome: 'existing' };
+    return { channel: existing, outcome: topicChanged ? 'updated' : 'existing' };
   }
 
   const stale = (oldNames ?? [])

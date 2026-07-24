@@ -128,6 +128,7 @@ async function runSetup(interaction: ChatInputCommandInteraction, guild: NonNull
       );
       if (chOutcome === 'created') created.push(`#${ch.name}`);
       else if (chOutcome === 'renamed') renamed.push(`#${ch.oldNames?.[0]} -> #${ch.name}`);
+      else if (chOutcome === 'updated') renamed.push(`#${ch.name}: topic updated`);
       else existing.push(`#${ch.name}`);
       if (ch.key && channel) channelByKey.set(ch.key, channel);
     }
