@@ -2,16 +2,16 @@ import fs from 'fs';
 import path from 'path';
 import { Client, Guild, GuildMember, TextChannel, NewsChannel } from 'discord.js';
 import { config } from '../../config';
-import { getLeaderboard } from '../../ard-client';
+import { getLeaderboard, listIdentities } from '../../ard-client';
 import {
-  SERVER_ROLE, DISPATCH_CHANNEL_NAMES, TIER_THRESHOLDS, DISPATCHER_ROLE,
+  SERVER_ROLE, CROSS_SERVER_ROLE, DISPATCH_CHANNEL_NAMES, TIER_THRESHOLDS, DISPATCHER_ROLE,
   AUTO_DISPATCHER_SURVEY_TIER_INDEX, tierRoleName, rotatingBadgeName, Track, Cadence,
 } from '../provision/structure';
 import { periodKey, periodStartMs } from './periods';
 import { isCurrentSession } from '../../runtime-lock';
 
 /**
- * Three independent jobs, run together on one long-interval timer (ranks don't
+ * Four independent jobs, run together on one long-interval timer (ranks don't
  * need dispatch-queue freshness):
  *  1. Tier-role sync -- recomputes each member's lifetime Survey/Road Crew
  *     counts and grants any newly-crossed tier role. STACKING: only ever
@@ -23,12 +23,24 @@ import { isCurrentSession } from '../../runtime-lock';
  *  3. Weekly/monthly rotating badge -- on a period rollover, recomputes that
  *     period's leader per track and moves the single rotating badge role to
  *     them, stripping it from whoever held it before.
+ *  4. Verified-role sync -- self-healing counterpart to /link's one-shot grant
+ *     (see link.ts): re-derives SERVER_ROLE membership from ARD's own
+ *     /identities/<server> roster every cycle, so anyone who linked via the
+ *     website (which never touches Discord), or whose grant failed
+ *     transiently, or who linked before the role existed, gets backfilled the
+ *     same way syncTierRoles already backfills tier roles. Also grants the
+ *     CROSS_SERVER_ROLE grand-prize once an identity holds every SERVER_ROLE
+ *     at once. Deliberately grant-only: a suspended identity is skipped (not
+ *     re-granted) but an already-held role is never stripped here -- role
+ *     removal on suspension, if wanted, is a separate decision.
  *
  * Both tracks are siloed per server, same as everywhere else in this project
  * (see structure.ts's own note on this) -- there is no cross-server ladder.
  * The Dispatcher role itself is the one exception: it's global (dispatch's
  * open/barracks/closed/records queue isn't split per server), so crossing the
- * threshold on either server is enough to earn it.
+ * threshold on either server is enough to earn it. CROSS_SERVER_ROLE (job 4)
+ * is the other exception, by definition -- it exists specifically to reward
+ * standing on every server at once.
  */
 
 const STATE_PATH = path.join(process.cwd(), 'tiers-state.json');
@@ -173,9 +185,76 @@ async function rotateBadge(
   serverState.holders[cadence][track] = leaderId;
 }
 
+async function syncVerifiedRoles(client: Client, recordsCh: TextChannel | NewsChannel | null): Promise<void> {
+  const guild = client.guilds.cache.get(config.discord.guildId);
+  if (!guild) return;
+
+  const servers = Object.keys(SERVER_ROLE);
+  // Which of SERVER_ROLE's servers each discordId is verified-and-not-suspended
+  // on, built up across the per-server loop below -- used afterward to grant
+  // CROSS_SERVER_ROLE to anyone who ends up covering every server.
+  const verifiedOn = new Map<string, Set<string>>();
+
+  for (const server of servers) {
+    const roleName = SERVER_ROLE[server];
+    const role = guild.roles.cache.find(r => r.name === roleName);
+    if (!role) continue; // /setup hasn't provisioned this role yet
+
+    let identities;
+    try {
+      identities = await listIdentities(server);
+    } catch (err) {
+      console.error(`[tiers] Failed to list identities for ${server}:`, err);
+      continue;
+    }
+
+    for (const identity of identities) {
+      if (identity.suspended) continue; // suspended falls back to Tier C -- not verified standing
+
+      const member = await guild.members.fetch(identity.discordId).catch(() => null);
+      if (!member) continue;
+
+      if (!member.roles.cache.has(role.id)) {
+        try {
+          await member.roles.add(role);
+        } catch (err) {
+          console.error(`[tiers] Failed to grant ${roleName} to ${identity.discordId}:`, err);
+          continue; // don't count this toward the cross-server grant below -- they don't actually hold it
+        }
+        await recordsCh?.send(`✅ <@${identity.discordId}> is now verified as a **${roleName}**!`).catch(err =>
+          console.error(`[tiers] Failed to post #records for ${roleName}:`, err));
+      }
+
+      if (!verifiedOn.has(identity.discordId)) verifiedOn.set(identity.discordId, new Set());
+      verifiedOn.get(identity.discordId)!.add(server);
+    }
+  }
+
+  if (servers.length < 2) return; // nothing to be "cross" between
+  const crossRole = guild.roles.cache.find(r => r.name === CROSS_SERVER_ROLE);
+  if (!crossRole) return; // /setup hasn't provisioned this role yet
+
+  for (const [discordId, onServers] of verifiedOn) {
+    if (!servers.every(s => onServers.has(s))) continue;
+    const member = await guild.members.fetch(discordId).catch(() => null);
+    if (!member || member.roles.cache.has(crossRole.id)) continue;
+    try {
+      await member.roles.add(crossRole);
+    } catch (err) {
+      console.error(`[tiers] Failed to grant ${CROSS_SERVER_ROLE} to ${discordId}:`, err);
+      continue;
+    }
+    await recordsCh?.send(
+      `🌐 <@${discordId}> just became an **${CROSS_SERVER_ROLE}** -- verified on every network!`
+    ).catch(err => console.error(`[tiers] Failed to post #records for ${CROSS_SERVER_ROLE}:`, err));
+  }
+}
+
 export async function syncTiersOnce(client: Client): Promise<void> {
   const state = loadState();
   const recordsCh = findChannel(client, DISPATCH_CHANNEL_NAMES.records);
+
+  await syncVerifiedRoles(client, recordsCh).catch(err => console.error('[tiers] Verified-role sync failed:', err));
 
   for (const server of Object.keys(SERVER_ROLE)) {
     try {

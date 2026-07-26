@@ -16,6 +16,9 @@
  *                                                       Worker earns dispatch-queue access this
  *                                                       way, same as Tier A/M already have via
  *                                                       their own rank (PROTOCOL.md SS6.7)
+ *   (no ARD equivalent)        -> Interstate Trucker -- auto (tiers.ts), cosmetic-only grand prize
+ *                                                       for holding every per-server Highway Worker
+ *                                                       role at once (see CROSS_SERVER_ROLE)
  *
  * Highway Worker and Highway Supervisor split per-server (2b2t/6b6t) because
  * ARD's own Tier A/B grants are strictly per-server -- someone verified on
@@ -39,6 +42,13 @@ export const TRAVELER_ROLE = 'Traveler';
 // Shared with tiers.ts's auto-promotion job (see AUTO_DISPATCHER_SURVEY_TIER_INDEX
 // below) and DISPATCH_ACCESS_ROLES -- one name so the two can never drift apart.
 export const DISPATCHER_ROLE = 'Dispatcher';
+
+// Auto-granted by tiers.ts's syncVerifiedRoles once a linked (non-suspended)
+// identity holds EVERY role in SERVER_ROLE at once -- i.e. verified on every
+// network ARD covers, not just one. Purely cosmetic recognition, same as the
+// Survey/Road Crew tiers: it carries no channel access of its own and self-
+// heals/re-derives every sync cycle rather than being a one-time award.
+export const CROSS_SERVER_ROLE = 'Interstate Trucker';
 
 // Bare per-server display prefix (no " Highway Worker" suffix) -- used to build the
 // Survey/Road Crew tier and rotating-badge role names below and the radar channel
@@ -134,6 +144,10 @@ export const ROLES: RoleSpec[] = [
   { name: 'Highway Patrol', color: 0xed4245, hoist: true, oldNames: ['Moderator'] },
   { name: 'Director', color: 0x9b59b6, hoist: true },
   { name: 'Branch Director', color: 0x71368a, hoist: true },
+  // Grand-prize cosmetic, see CROSS_SERVER_ROLE's own comment above. Deliberately
+  // absent from every CategorySpec.visibleTo below, same as the generated
+  // contribution roles just below it -- flex only, opens nothing on its own.
+  { name: CROSS_SERVER_ROLE, color: 0xe91e63, hoist: true },
   // Survey/Road Crew tiers + weekly/monthly rotating badges -- see the generation
   // loop above tierRoleName/rotatingBadgeName. Deliberately absent from every
   // CategorySpec.visibleTo below: these carry no channel access of their own.
